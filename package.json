@@ -1,0 +1,16 @@
+{
+  "name": "toolsforge",
+  "version": "1.0.0",
+  "description": "Modular AI workspace platform",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "cd server && node index.js",
+    "dev": "cd server && nodemon index.js",
+    "install": "cd server && npm install"
+  },
+  "engines": {
+    "node": "22.x"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}
