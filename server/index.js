@@ -1,6 +1,7 @@
 require('dotenv').config({ path: '../.env' });
 const express = require('express');
 const cors = require('cors');
+const path = require('path');
 const { pool, runMigrations } = require('./db');
 const authRoutes        = require('./routes/auth');
 const toolsRoutes       = require('./routes/tools');
@@ -42,6 +43,15 @@ app.use('/api/tools',             toolsRoutes);
 app.use('/api/admin',       adminRoutes);
 app.use('/api/org',         orgRoutes);
 app.use('/api/invitations', invitationRoutes);
+
+// Serve React app in production — must come after all API routes
+if (process.env.NODE_ENV === 'production') {
+  const clientDist = path.join(__dirname, '../client/dist');
+  app.use(express.static(clientDist));
+  app.get('*', (req, res) => {
+    res.sendFile(path.join(clientDist, 'index.html'));
+  });
+}
 
 // Start server
 async function start() {
