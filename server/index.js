@@ -44,9 +44,10 @@ app.use('/api/admin',       adminRoutes);
 app.use('/api/org',         orgRoutes);
 app.use('/api/invitations', invitationRoutes);
 
-// Serve React app in production — must come after all API routes
-if (process.env.NODE_ENV === 'production') {
-  const clientDist = path.join(__dirname, '../client/dist');
+// Serve React app if client/dist exists (production build present)
+const clientDist = path.join(__dirname, '../client/dist');
+const fs = require('fs');
+if (fs.existsSync(clientDist)) {
   app.use(express.static(clientDist));
   app.get('*', (req, res) => {
     res.sendFile(path.join(clientDist, 'index.html'));
