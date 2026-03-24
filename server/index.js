@@ -47,7 +47,10 @@ app.use('/api/invitations', invitationRoutes);
 // Serve React app if client/dist exists (production build present)
 const clientDist = path.join(__dirname, 'public');
 const fs = require('fs');
+console.log('Static dir:', clientDist);
+console.log('Static dir exists:', fs.existsSync(clientDist));
 if (fs.existsSync(clientDist)) {
+  console.log('Static dir contents:', fs.readdirSync(clientDist));
   app.use(express.static(clientDist));
   app.get('*', (req, res) => {
     res.sendFile(path.join(clientDist, 'index.html'));
