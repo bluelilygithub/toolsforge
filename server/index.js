@@ -13,6 +13,8 @@ const invitationRoutes  = require('./routes/invitations');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+app.set('trust proxy', 1);
+
 // CORS — only applied to API routes (static files are same-origin, no CORS needed)
 const allowedOrigins = [
   process.env.APP_URL,
@@ -24,7 +26,7 @@ const corsMiddleware = cors({
   origin: (origin, callback) => {
     if (!origin) return callback(null, true);
     if (allowedOrigins.includes(origin)) return callback(null, true);
-    callback(new Error('Not allowed by CORS'));
+    callback(null, false);
   },
   credentials: true,
 });
