@@ -12,7 +12,7 @@ WORKDIR /app/server
 COPY server/package*.json ./
 RUN npm install --omit=dev
 COPY server/ ./
-COPY --from=client-build /app/client/dist /app/client/dist
+COPY --from=client-build /app/client/dist /app/server/public
 
 EXPOSE 3001
 CMD ["node", "index.js"]

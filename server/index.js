@@ -45,7 +45,7 @@ app.use('/api/org',         orgRoutes);
 app.use('/api/invitations', invitationRoutes);
 
 // Serve React app if client/dist exists (production build present)
-const clientDist = path.join(__dirname, '../client/dist');
+const clientDist = path.join(__dirname, 'public');
 const fs = require('fs');
 if (fs.existsSync(clientDist)) {
   app.use(express.static(clientDist));
