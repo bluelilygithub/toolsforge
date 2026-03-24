@@ -2,13 +2,31 @@ require('dotenv').config({ path: '../.env' });
 const express = require('express');
 const cors = require('cors');
 const { pool, runMigrations } = require('./db');
-const authRoutes = require('./routes/auth');
+const authRoutes        = require('./routes/auth');
+const toolsRoutes       = require('./routes/tools');
+const adminRoutes       = require('./routes/admin');
+const orgRoutes         = require('./routes/org');
+const invitationRoutes  = require('./routes/invitations');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Middleware
-app.use(cors());
+// CORS — locked to known origins
+const allowedOrigins = [
+  process.env.APP_URL,
+  'http://localhost:5173',
+  'http://localhost:3000',
+].filter(Boolean);
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+}));
+
 app.use(express.json());
 
 // Health check
@@ -16,23 +34,23 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Auth routes
-app.use('/api/auth', authRoutes);
+// Routes
+app.use('/api/auth',        authRoutes);
+app.use('/api/tools',       toolsRoutes);
+app.use('/api/admin',       adminRoutes);
+app.use('/api/org',         orgRoutes);
+app.use('/api/invitations', invitationRoutes);
 
 // Start server
 async function start() {
   try {
-    // Run migrations first
     await runMigrations();
-    
-    // Then start server
     app.listen(PORT, () => {
-      console.log(`✅ Server running on port ${PORT}`);
-      console.log(`📍 Health check: http://localhost:${PORT}/api/health`);
-      console.log(`🔐 Auth endpoints: http://localhost:${PORT}/api/auth/*`);
+      console.log(`Server running on port ${PORT}`);
+      console.log(`Health: http://localhost:${PORT}/api/health`);
     });
   } catch (error) {
-    console.error('❌ Server failed to start:', error);
+    console.error('Server failed to start:', error);
     process.exit(1);
   }
 }

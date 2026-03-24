@@ -1,12 +1,14 @@
 const express = require('express');
-const bcrypt = require('bcrypt');
+const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const { pool } = require('../db');
+const { requireAuth } = require('../middleware/requireAuth');
+const { authLimiter } = require('../middleware/rateLimit');
 
 const router = express.Router();
 
 // Register new user
-router.post('/register', async (req, res) => {
+router.post('/register', authLimiter, async (req, res) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
@@ -18,34 +20,41 @@ router.post('/register', async (req, res) => {
   }
 
   try {
-    // Get default org
     const orgResult = await pool.query('SELECT id FROM organizations LIMIT 1');
     const orgId = orgResult.rows[0].id;
 
-    // Hash password
     const passwordHash = await bcrypt.hash(password, 10);
 
-    // Create user
     const result = await pool.query(
-      `INSERT INTO users (org_id, email, password_hash, role) 
-       VALUES ($1, $2, $3, $4) 
-       RETURNING id, email, role, created_at`,
-      [orgId, email.toLowerCase(), passwordHash, 'member']
+      `INSERT INTO users (org_id, email, password_hash)
+       VALUES ($1, $2, $3)
+       RETURNING id, email, created_at`,
+      [orgId, email.toLowerCase(), passwordHash]
     );
 
+    // Assign default org_member role
+    const memberRole = await pool.query(
+      'SELECT id FROM roles WHERE name = $1',
+      ['org_member']
+    );
+
+    if (memberRole.rows.length > 0) {
+      await pool.query(
+        `INSERT INTO user_roles (user_id, role_id, scope_type)
+         VALUES ($1, $2, 'global')
+         ON CONFLICT DO NOTHING`,
+        [result.rows[0].id, memberRole.rows[0].id]
+      );
+    }
+
     const user = result.rows[0];
-    res.status(201).json({ 
+    res.status(201).json({
       message: 'User created successfully',
-      user: {
-        id: user.id,
-        email: user.email,
-        role: user.role,
-        created_at: user.created_at
-      }
+      user: { id: user.id, email: user.email, created_at: user.created_at }
     });
 
   } catch (error) {
-    if (error.code === '23505') { // Unique violation
+    if (error.code === '23505') {
       return res.status(409).json({ error: 'Email already exists' });
     }
     console.error('Register error:', error);
@@ -54,7 +63,7 @@ router.post('/register', async (req, res) => {
 });
 
 // Login
-router.post('/login', async (req, res) => {
+router.post('/login', authLimiter, async (req, res) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
@@ -62,9 +71,8 @@ router.post('/login', async (req, res) => {
   }
 
   try {
-    // Find user
     const result = await pool.query(
-      'SELECT id, email, password_hash, role FROM users WHERE email = $1',
+      'SELECT id, email, password_hash, is_active FROM users WHERE email = $1',
       [email.toLowerCase()]
     );
 
@@ -74,19 +82,30 @@ router.post('/login', async (req, res) => {
 
     const user = result.rows[0];
 
-    // Check password
+    if (!user.is_active || !user.password_hash) {
+      return res.status(401).json({ error: 'Account pending activation — check your invitation email' });
+    }
+
     const valid = await bcrypt.compare(password, user.password_hash);
+
     if (!valid) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    // Create session token
+    // Fetch user roles for the response
+    const rolesResult = await pool.query(
+      `SELECT r.name, ur.scope_type, ur.scope_id
+       FROM user_roles ur
+       JOIN roles r ON r.id = ur.role_id
+       WHERE ur.user_id = $1`,
+      [user.id]
+    );
+
     const token = crypto.randomBytes(32).toString('hex');
-    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
     await pool.query(
-      `INSERT INTO auth_sessions (user_id, token, expires_at) 
-       VALUES ($1, $2, $3)`,
+      `INSERT INTO auth_sessions (user_id, token, expires_at) VALUES ($1, $2, $3)`,
       [user.id, token, expiresAt]
     );
 
@@ -96,7 +115,7 @@ router.post('/login', async (req, res) => {
       user: {
         id: user.id,
         email: user.email,
-        role: user.role
+        roles: rolesResult.rows
       }
     });
 
@@ -107,15 +126,9 @@ router.post('/login', async (req, res) => {
 });
 
 // Logout
-router.post('/logout', async (req, res) => {
-  const token = req.headers.authorization?.replace('Bearer ', '');
-
-  if (!token) {
-    return res.status(401).json({ error: 'No token provided' });
-  }
-
+router.post('/logout', requireAuth, async (req, res) => {
   try {
-    await pool.query('DELETE FROM auth_sessions WHERE token = $1', [token]);
+    await pool.query('DELETE FROM auth_sessions WHERE token = $1', [req.token]);
     res.json({ message: 'Logged out successfully' });
   } catch (error) {
     console.error('Logout error:', error);
@@ -124,27 +137,24 @@ router.post('/logout', async (req, res) => {
 });
 
 // Get current user
-router.get('/me', async (req, res) => {
-  const token = req.headers.authorization?.replace('Bearer ', '');
-
-  if (!token) {
-    return res.status(401).json({ error: 'No token provided' });
-  }
-
+router.get('/me', requireAuth, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT u.id, u.email, u.role, u.created_at
-       FROM users u
-       JOIN auth_sessions s ON u.id = s.user_id
-       WHERE s.token = $1 AND s.expires_at > NOW()`,
-      [token]
+    const rolesResult = await pool.query(
+      `SELECT r.name, ur.scope_type, ur.scope_id
+       FROM user_roles ur
+       JOIN roles r ON r.id = ur.role_id
+       WHERE ur.user_id = $1`,
+      [req.user.id]
     );
 
-    if (result.rows.length === 0) {
-      return res.status(401).json({ error: 'Invalid or expired token' });
-    }
-
-    res.json({ user: result.rows[0] });
+    res.json({
+      user: {
+        id: req.user.id,
+        email: req.user.email,
+        org_id: req.user.org_id,
+        roles: rolesResult.rows
+      }
+    });
 
   } catch (error) {
     console.error('Get user error:', error);
