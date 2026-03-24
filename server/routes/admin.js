@@ -1,9 +1,11 @@
 const express = require('express');
+const Anthropic = require('@anthropic-ai/sdk');
 const { pool } = require('../db');
 const { requireAuth, requireRole } = require('../middleware/requireAuth');
 const InvitationService = require('../services/invitations');
 const PermissionService = require('../services/permissions');
 const EmailTemplateService = require('../services/emailTemplates');
+const { MODEL_CATALOGUE } = require('../utils/modelCatalogue');
 const logger = require('../utils/logger');
 
 const router = express.Router();
@@ -194,6 +196,124 @@ router.get('/logs', async (req, res) => {
   } catch (error) {
     logger.error('Fetch logs error', { error: error.message });
     res.status(500).json({ error: 'Failed to fetch logs' });
+  }
+});
+
+// ── Tool roles — dynamic list for the Grant Access dropdown ───────────────────
+
+// GET /api/admin/tool-roles — all assignable roles across every enabled tool
+router.get('/tool-roles', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT slug, name, config FROM tools WHERE enabled = true ORDER BY name`
+    );
+    const roles = [];
+    for (const tool of result.rows) {
+      const toolRoles = tool.config?.roles ?? [];
+      for (const role of toolRoles) {
+        roles.push({
+          name:     role.name,
+          label:    role.label,
+          scopeId:  role.scopeId,
+          toolName: tool.name,
+          toolSlug: tool.slug,
+        });
+      }
+    }
+    res.json(roles);
+  } catch (err) {
+    logger.error('Fetch tool-roles error', { error: err.message });
+    res.status(500).json({ error: 'Failed to fetch tool roles' });
+  }
+});
+
+// ── AI Models ─────────────────────────────────────────────────────────────────
+
+// GET /api/admin/ai-models — return live model list from system_settings
+router.get('/ai-models', async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT value FROM system_settings WHERE key = 'ai_models'`);
+    const models = result.rows[0]?.value ?? [];
+    res.json({ models: Array.isArray(models) ? models : [] });
+  } catch (err) {
+    logger.error('Fetch ai-models error', { error: err.message });
+    res.status(500).json({ error: 'Failed to fetch AI models' });
+  }
+});
+
+// PUT /api/admin/ai-models — save full model array
+router.put('/ai-models', async (req, res) => {
+  const { models } = req.body;
+  if (!Array.isArray(models)) return res.status(400).json({ error: 'models must be an array' });
+
+  try {
+    await pool.query(
+      `INSERT INTO system_settings (key, value, updated_by, updated_at)
+       VALUES ('ai_models', $1::jsonb, $2, NOW())
+       ON CONFLICT (key) DO UPDATE
+         SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+      [JSON.stringify(models), req.user.id]
+    );
+    logger.info('AI models updated', { count: models.length, updatedBy: req.user.email });
+    res.json({ message: 'AI models saved', count: models.length });
+  } catch (err) {
+    logger.error('Save ai-models error', { error: err.message });
+    res.status(500).json({ error: 'Failed to save AI models' });
+  }
+});
+
+// POST /api/admin/ai-models/reset — restore default catalogue
+router.post('/ai-models/reset', async (req, res) => {
+  try {
+    const defaults = Object.entries(MODEL_CATALOGUE).map(([id, m]) => ({ id, ...m }));
+    await pool.query(
+      `INSERT INTO system_settings (key, value, updated_by, updated_at)
+       VALUES ('ai_models', $1::jsonb, $2, NOW())
+       ON CONFLICT (key) DO UPDATE
+         SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+      [JSON.stringify(defaults), req.user.id]
+    );
+    logger.info('AI models reset to defaults', { resetBy: req.user.email });
+    res.json({ message: 'Reset to defaults', models: defaults });
+  } catch (err) {
+    logger.error('Reset ai-models error', { error: err.message });
+    res.status(500).json({ error: 'Failed to reset AI models' });
+  }
+});
+
+// GET /api/admin/model-status — whether ANTHROPIC_API_KEY is configured
+router.get('/model-status', (req, res) => {
+  res.json({ anthropic: !!process.env.ANTHROPIC_API_KEY });
+});
+
+// POST /api/admin/test-model — send a minimal probe to Anthropic
+router.post('/test-model', async (req, res) => {
+  const { modelId } = req.body;
+  if (!modelId) return res.status(400).json({ ok: false, error: 'modelId required' });
+
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return res.json({ ok: false, error: 'ANTHROPIC_API_KEY is not set on the server.' });
+  }
+
+  try {
+    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    const response = await anthropic.messages.create({
+      model: modelId,
+      max_tokens: 32,
+      messages: [{ role: 'user', content: 'Reply with just: ok' }],
+    });
+    const text = response.content?.[0]?.text?.trim() ?? '(no text)';
+    logger.info('Model test ok', { modelId, testedBy: req.user.email });
+    res.json({ ok: true, response: text });
+  } catch (err) {
+    const msg = err.message ?? 'Unknown error';
+    let hint = '';
+    if (/auth|api.?key|credential/i.test(msg))          hint = 'Check ANTHROPIC_API_KEY is valid.';
+    else if (/billing|credit|payment/i.test(msg))       hint = 'Account billing issue — check Anthropic console.';
+    else if (/not.found|invalid.model|unknown.model/i.test(msg)) hint = 'Model ID not recognised by the API.';
+    else if (/rate.limit/i.test(msg))                   hint = 'Rate limit hit — try again shortly.';
+    logger.warn('Model test failed', { modelId, error: msg });
+    res.json({ ok: false, error: msg, hint });
   }
 });
 

@@ -189,6 +189,32 @@ async function initializeSchema() {
       CREATE INDEX IF NOT EXISTS idx_password_history_user_id ON password_history(user_id)
     `);
 
+    // AI usage logs — one row per response, used for cost tracking and spend alerts
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS usage_logs (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        tool_slug TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+        cost_usd NUMERIC(10,6) NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_usage_logs_user_id ON usage_logs(user_id)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_usage_logs_created_at ON usage_logs(created_at DESC)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_usage_logs_user_date ON usage_logs(user_id, created_at DESC)
+    `);
+
     // Tool registry
     await client.query(`
       CREATE TABLE IF NOT EXISTS tools (
@@ -316,15 +342,41 @@ async function seedDefaults() {
 
     // Register datetime tool
     await client.query(`
-      INSERT INTO tools (slug, name, version, enabled)
-      VALUES ('datetime', 'Date & Time', '1.0.0', true)
-      ON CONFLICT (slug) DO UPDATE SET enabled = true
-    `);
+      INSERT INTO tools (slug, name, version, enabled, config)
+      VALUES ('datetime', 'Date & Time', '1.0.0', true, $1::jsonb)
+      ON CONFLICT (slug) DO UPDATE SET enabled = true, config = EXCLUDED.config
+    `, [JSON.stringify({
+      roles: [
+        { name: 'datetime_viewer',   label: 'Date & Time — Basic',    scopeId: 'datetime' },
+        { name: 'datetime_extended', label: 'Date & Time — Extended', scopeId: 'datetime' },
+      ],
+    })]);
+
+    // Register chat tool
+    await client.query(`
+      INSERT INTO tools (slug, name, version, enabled, config)
+      VALUES ('chat', 'AI Chat', '1.0.0', true, $1::jsonb)
+      ON CONFLICT (slug) DO UPDATE SET enabled = true, config = EXCLUDED.config
+    `, [JSON.stringify({
+      // org_member is the floor — all members can use standard (Haiku) by default.
+      // Admins grant chat_advanced or chat_premium to specific users as needed.
+      roleModelAccess: {
+        org_member:    'standard',
+        chat_advanced: 'advanced',
+        chat_premium:  'premium',
+      },
+      roles: [
+        { name: 'chat_advanced', label: 'AI Chat — Advanced (Sonnet)', scopeId: 'chat' },
+        { name: 'chat_premium',  label: 'AI Chat — Premium (Opus)',    scopeId: 'chat' },
+      ],
+    })]);
 
     // Datetime tool roles
     for (const role of [
-      { name: 'datetime_viewer',  description: 'View date and time' },
+      { name: 'datetime_viewer',   description: 'View date and time' },
       { name: 'datetime_extended', description: 'View date, time, and server location' },
+      { name: 'chat_advanced',     description: 'AI Chat — Advanced model tier (Sonnet)' },
+      { name: 'chat_premium',      description: 'AI Chat — Premium model tier (Opus)' },
     ]) {
       await client.query(
         `INSERT INTO roles (name, description, is_system)
@@ -347,6 +399,66 @@ async function seedDefaults() {
       );
     }
     logger.info('Email templates seeded');
+
+    // Seed default spend alert thresholds (do not overwrite admin edits)
+    for (const [key, value] of [
+      ['spend_warn_session_usd', 0.50],
+      ['spend_warn_daily_usd',   5.00],
+    ]) {
+      await client.query(
+        `INSERT INTO system_settings (key, value) VALUES ($1, $2::jsonb) ON CONFLICT (key) DO NOTHING`,
+        [key, JSON.stringify(value)]
+      );
+    }
+    logger.info('Spend alert thresholds seeded');
+
+    // Seed default AI model catalogue (do not overwrite admin edits)
+    const defaultModels = [
+      {
+        id:                'claude-haiku-4-5-20251001',
+        name:              'Claude Haiku 4.5',
+        tier:              'standard',
+        provider:          'anthropic',
+        emoji:             '⚡',
+        label:             'Economy',
+        tagline:           'Fast & affordable',
+        desc:              'Best for quick tasks, simple queries, and background automation',
+        inputPricePer1M:   0.80,
+        outputPricePer1M:  4.00,
+        contextWindow:     200000,
+      },
+      {
+        id:                'claude-sonnet-4-6',
+        name:              'Claude Sonnet 4.6',
+        tier:              'advanced',
+        provider:          'anthropic',
+        emoji:             '⚖️',
+        label:             'Standard',
+        tagline:           'Smart & balanced',
+        desc:              'Best for most work — writing, analysis, and tool workloads',
+        inputPricePer1M:   3.00,
+        outputPricePer1M:  15.00,
+        contextWindow:     200000,
+      },
+      {
+        id:                'claude-opus-4-6',
+        name:              'Claude Opus 4.6',
+        tier:              'premium',
+        provider:          'anthropic',
+        emoji:             '🧠',
+        label:             'Premium',
+        tagline:           'Most capable',
+        desc:              'Best for complex reasoning, deep analysis, and large-context tasks',
+        inputPricePer1M:   15.00,
+        outputPricePer1M:  75.00,
+        contextWindow:     200000,
+      },
+    ];
+    await client.query(
+      `INSERT INTO system_settings (key, value) VALUES ('ai_models', $1::jsonb) ON CONFLICT (key) DO NOTHING`,
+      [JSON.stringify(defaultModels)]
+    );
+    logger.info('AI model catalogue seeded');
 
   } catch (error) {
     logger.error('Seeding failed', { error: error.message });

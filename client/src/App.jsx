@@ -10,10 +10,12 @@ import SettingsPage from './pages/SettingsPage';
 import AdminUsersPage from './pages/AdminUsersPage';
 import AdminLogsPage from './pages/AdminLogsPage';
 import AdminEmailTemplatesPage from './pages/AdminEmailTemplatesPage';
+import AdminAIModelsPage from './pages/AdminAIModelsPage';
 import AcceptInvitePage from './pages/AcceptInvitePage';
 import ForgotPasswordPage from './pages/ForgotPasswordPage';
 import ResetPasswordPage from './pages/ResetPasswordPage';
 import DateTimePage from './pages/DateTimePage';
+import ChatPage from './pages/ChatPage';
 
 function App() {
   return (
@@ -32,7 +34,9 @@ function App() {
                 <Route path="/admin/users" element={<AdminUsersPage />} />
                 <Route path="/admin/logs" element={<AdminLogsPage />} />
                 <Route path="/admin/email-templates" element={<AdminEmailTemplatesPage />} />
+                <Route path="/admin/ai-models" element={<AdminAIModelsPage />} />
                 <Route path="/tools/datetime" element={<DateTimePage />} />
+                <Route path="/tools/chat" element={<ChatPage />} />
                 <Route path="*" element={<Navigate to="/" replace />} />
               </Route>
             </Routes>

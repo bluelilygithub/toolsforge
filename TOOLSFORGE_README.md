@@ -1,9 +1,9 @@
 # ToolsForge
 
 **Built by:** Michael Barrett
-**Purpose:** Multi-user modular platform — a foundation for building shared tools across an organisation
-**Status:** Foundation complete — auth, roles, permission service, invitation workflow, email delivery, password reset, profile management, password history, structured logging, in-app log viewer, email template management, admin UI, datetime tool proving tool-scoped permissions end-to-end
-**Stack:** Node.js/Express · PostgreSQL · Docker · Railway · React/Vite · Tailwind CSS
+**Purpose:** Multi-user modular platform — a foundation for building shared AI tools across an organisation
+**Status:** Foundation complete — auth, roles, permission service, invitation workflow, email delivery, password reset, profile management, password history, structured logging, in-app log viewer, email template management, font/theme customisation, AI model catalogue, role-based model permissions, SSE streaming backbone, AI Chat tool, admin UI
+**Stack:** Node.js/Express · PostgreSQL · Docker · Railway · React/Vite · Tailwind CSS · Anthropic Claude
 
 ---
 
@@ -38,10 +38,12 @@ Single source of truth for all authorisation checks. Every route and future tool
 | `getUserRoles(userId, scopeType)` | Return all role assignments, optionally filtered by scope type |
 | `grantRole(userId, roleName, scope, grantedBy)` | Assign a role, creating it if it doesn't exist |
 | `revokeRole(userId, roleName, scope)` | Remove a role assignment |
+| `getPermittedModels(userId, toolSlug)` | Return models the user may use for a tool, resolved from tool config + user roles |
+| `canUseModel(userId, toolSlug, modelId)` | Check whether a user may use a specific model for a tool |
 
 **Role scoping tiers:**
 - `global` — applies across the entire organisation (e.g. `org_admin`)
-- `tool` — applies within a specific tool (e.g. `chat_editor` scoped to `chat`)
+- `tool` — applies within a specific tool (e.g. `chat_advanced` scoped to `chat`)
 - `resource` — applies to a specific record (e.g. `project_owner` scoped to project id `42`)
 
 A global role satisfies any scope check. Scoping is stored in `user_roles(scope_type, scope_id)` — not in the users table.
@@ -91,6 +93,101 @@ Templates use `{{variableName}}` placeholder syntax replaced at send time. Each 
 3. In tool code, call `EmailTemplateService.render('my_slug', { var1, var2 })` then `send({ to, ...result })`
 4. Admin can edit the template content at any time via **Admin → Email Templates** — no code deploy needed
 
+#### AI Model Catalogue (`server/utils/modelCatalogue.js`)
+Defines every AI model available in ToolsForge. The live source of truth at runtime is the `ai_models` key in `system_settings` (DB), which admins can edit without a redeploy. The static `MODEL_CATALOGUE` in this file serves as the seed default and fallback if the DB is unavailable.
+
+| Export | Description |
+|---|---|
+| `MODEL_CATALOGUE` | Static default model definitions (seed + fallback) |
+| `TIER_ORDER` | `['standard', 'advanced', 'premium']` |
+| `getModelsFromDB()` | Load live model list from `system_settings` with static fallback |
+| `getModelsForTierFromDB(maxTier)` | Return DB models at or below the given tier |
+| `getModelFromDB(modelId)` | Look up a single model by ID from DB |
+| `getModelsForTier(maxTier)` | Sync version — uses static catalogue only |
+| `getModel(modelId)` | Sync version — uses static catalogue only |
+
+**Model tiers:**
+| Tier | Class | Default model |
+|---|---|---|
+| `standard` | Fast, affordable | Claude Haiku 4.5 |
+| `advanced` | Balanced | Claude Sonnet 4.6 |
+| `premium` | Maximum capability | Claude Opus 4.6 |
+
+#### Cost Calculator (`server/services/costCalculator.js`)
+Calculates USD cost from Anthropic token counts. Reads live pricing from the DB model catalogue; falls back to a static pricing map.
+
+- Cache read tokens billed at 10% of input price
+- Cache write tokens billed at 125% of input price
+- `calculateCost({ modelId, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens })` — async, returns USD cost
+
+#### Usage Logger (`server/services/usageLogger.js`)
+Records every AI response to `usage_logs` and checks spend thresholds.
+
+| Function | Description |
+|---|---|
+| `logUsage(params)` | Insert one row into `usage_logs`; returns costUsd |
+| `checkSpendThresholds(params)` | Read thresholds from `system_settings`; fire `logger.warn` to `app_logs` when crossed |
+| `logAndCheck(params)` | Convenience — log usage then immediately check thresholds; single call from SSE handlers |
+
+Threshold warnings appear in **Admin → Logs** without any additional infrastructure.
+
+#### SSE Streaming (`server/routes/stream.js`)
+Generic SSE endpoint used by all AI tools. Tools delegate to this — no tool writes its own streaming logic.
+
+**`POST /api/tools/:toolSlug/stream`**
+
+Request body:
+```json
+{ "model": "claude-sonnet-4-6", "messages": [...], "system": "...", "maxTokens": 4096 }
+```
+
+SSE event stream:
+```
+data: {"type":"status","status":"connecting"}
+data: {"type":"text","text":"...chunk..."}
+data: {"type":"usage","inputTokens":N,"outputTokens":N,"costUsd":N,"sessionTotal":N,"dailyTotal":N,"warnings":[...]}
+data: [DONE]
+```
+
+Permission check fires before the stream opens — returns 403 if the user's roles do not permit the requested model for the tool.
+
+**`GET /api/tools/:toolSlug/permitted-models`**
+
+Returns the list of models the authenticated user may use for a given tool. Resolved by `PermissionService.getPermittedModels`.
+
+#### Tool Model Access Policy
+Each tool defines its model access policy in `tools.config.roleModelAccess` — a map of role name to tier. `PermissionService.getPermittedModels` reads this at request time; org_admin always receives all models regardless.
+
+**Chat tool policy (default):**
+```json
+{
+  "roleModelAccess": {
+    "org_member":    "standard",
+    "chat_advanced": "advanced",
+    "chat_premium":  "premium"
+  }
+}
+```
+
+This means:
+- All org members can use Haiku by default — no admin action needed
+- Admin grants `chat_advanced` to a user to unlock Sonnet
+- Admin grants `chat_premium` to a user to unlock Opus
+
+#### Tool Role Registry
+Each tool's `config.roles` array defines the roles an admin can grant to users for that tool. This drives the **Grant Access** dropdown in Admin → Users dynamically — adding a new tool requires no changes to admin UI code.
+
+```json
+{
+  "roles": [
+    { "name": "chat_advanced", "label": "AI Chat — Advanced (Sonnet)", "scopeId": "chat" },
+    { "name": "chat_premium",  "label": "AI Chat — Premium (Opus)",    "scopeId": "chat" }
+  ]
+}
+```
+
+`GET /api/admin/tool-roles` aggregates these across all enabled tools.
+
 #### API Endpoints
 
 | Endpoint | Method | Auth | Description |
@@ -108,12 +205,20 @@ Templates use `{{variableName}}` placeholder syntax replaced at send time. Each 
 | `/api/org` | GET | Yes | Current organisation details |
 | `/api/tools` | GET | Yes | List installed tools |
 | `/api/tools/datetime` | GET | tool role or org_admin | Datetime tool — basic or extended response by role |
+| `/api/tools/:toolSlug/permitted-models` | GET | Yes | Models the user may use for this tool |
+| `/api/tools/:toolSlug/stream` | POST | Yes | SSE stream — Anthropic response chunked as events |
 | `/api/admin/users` | GET | org_admin | All users with roles and activation status |
 | `/api/admin/invite` | POST | org_admin | Create invitation, sends email, returns activation URL |
 | `/api/admin/users/:id/resend-invite` | POST | org_admin | Regenerate activation link, sends email |
 | `/api/admin/users/:id/roles` | GET | org_admin | All roles for a user (global + tool-scoped) |
 | `/api/admin/users/:id/grant-role` | POST | org_admin | Grant a role at any scope |
 | `/api/admin/users/:id/revoke-role` | POST | org_admin | Revoke a role at any scope |
+| `/api/admin/tool-roles` | GET | org_admin | All assignable tool roles across enabled tools |
+| `/api/admin/ai-models` | GET | org_admin | Live model catalogue from system_settings |
+| `/api/admin/ai-models` | PUT | org_admin | Save full model array to system_settings |
+| `/api/admin/ai-models/reset` | POST | org_admin | Restore default model catalogue |
+| `/api/admin/model-status` | GET | org_admin | Whether ANTHROPIC_API_KEY is configured |
+| `/api/admin/test-model` | POST | org_admin | Send a live probe to an Anthropic model |
 | `/api/admin/logs` | GET | org_admin | Paginated app logs — filter by level and message |
 | `/api/admin/email-templates` | GET | org_admin | List all email templates |
 | `/api/admin/email-templates/:slug` | GET | org_admin | Get single template with full HTML and plain text body |
@@ -135,12 +240,13 @@ Templates use `{{variableName}}` placeholder syntax replaced at send time. Each 
 | `auth_sessions` | Token-based sessions with expiry |
 | `password_reset_tokens` | One-time 1-hour tokens for password reset flow |
 | `password_history` | Last N password hashes per user — reuse blocked on change and reset |
-| `roles` | System-defined roles (`org_admin`, `org_member`) + tool-defined roles (`datetime_viewer`, `datetime_extended`, …) |
+| `roles` | System-defined roles (`org_admin`, `org_member`) + tool-defined roles (`datetime_viewer`, `chat_advanced`, …) |
 | `user_roles` | Many-to-many role assignments with contextual scoping (`global` / `tool` / `resource`) |
 | `invitation_tokens` | One-time 48h activation tokens for invited users |
 | `user_settings` | JSONB key/value settings per user |
-| `system_settings` | Admin-managed global configuration |
-| `tools` | Tool registry — slug, name, version, enabled flag, schema name |
+| `system_settings` | Admin-managed global config — spend thresholds, AI model catalogue |
+| `tools` | Tool registry — slug, name, version, enabled flag, JSONB config (roleModelAccess, roles) |
+| `usage_logs` | One row per AI response — model, tokens, cost, user, tool |
 | `app_logs` | Server log entries (info, warn, error) written by Winston DB transport |
 | `email_templates` | Admin-editable email templates — slug, subject, body_html, body_text, variables array, tool_slug |
 
@@ -151,6 +257,8 @@ Templates use `{{variableName}}` placeholder syntax replaced at send time. Each 
 - `user_roles` unique index uses `COALESCE(scope_id, '')` to handle nullable scope correctly
 - `password_history` stores hashed passwords only — checked with `bcrypt.compare`, never stored in plain text
 - `app_logs` stores `info`, `warn`, `error` — `http` request logs are console-only to avoid table bloat
+- `system_settings` holds both operational config (spend thresholds) and the live AI model catalogue
+- `tools.config` JSONB stores both the model access policy (`roleModelAccess`) and the list of grantable roles (`roles`) — a new tool is self-describing with no admin UI code changes needed
 
 ---
 
@@ -162,9 +270,9 @@ Located in `client/`.
 Ported from Curam Vault — same patterns, rebranded for ToolsForge:
 - CSS custom properties for theming (`--color-bg`, `--color-surface`, `--color-border`, `--color-primary`, `--color-text`, `--color-muted`)
 - 5 themes: Warm Sand (default), Dark Slate, Forest, Midnight Blue, Paper White
-- Font switcher: DM Sans (default), Inter, Lato, Merriweather, JetBrains Mono
-- Lucide icon set via `IconProvider`
-- `ThemeProvider` injects CSS variables dynamically — no page reload needed
+- Separate body font and heading font pickers — 16 Google Fonts across sans-serif, serif, and monospace categories
+- Lucide icon set via `IconProvider` with semantic name mapping
+- `ThemeProvider` loads Google Fonts dynamically and injects CSS variables — no page reload needed
 - Zustand stores persisted to localStorage
 
 #### Pages
@@ -178,9 +286,11 @@ Ported from Curam Vault — same patterns, rebranded for ToolsForge:
 | Dashboard | `/` | Authenticated |
 | Settings | `/settings` | Authenticated |
 | Admin — Users | `/admin/users` | org_admin only |
+| Admin — AI Models | `/admin/ai-models` | org_admin only |
 | Admin — Email Templates | `/admin/email-templates` | org_admin only |
 | Admin — Logs | `/admin/logs` | org_admin only |
 | Date & Time tool | `/tools/datetime` | datetime role or org_admin |
+| AI Chat tool | `/tools/chat` | org_member or org_admin |
 
 **Login** — Vault-style card layout. ToolsForge brand mark. Email/password with show/hide toggle. "Forgot password?" link below sign-in button.
 
@@ -194,9 +304,11 @@ Ported from Curam Vault — same patterns, rebranded for ToolsForge:
 
 **Settings — Profile tab** — Email (read-only). First name + last name (side by side) + phone. Change password section with current/new/confirm fields and show/hide toggles. Password reuse of last 5 is blocked server-side.
 
-**Settings — Appearance tab** — Live theme picker (5 swatches), font picker.
+**Settings — Appearance tab** — Live theme picker (5 swatches). Font picker with two tabs: Body Font and Heading Font. Fonts grouped by category (sans-serif, serif, monospace) with sample text previews. Selections apply immediately via CSS custom properties.
 
-**Admin — Users** — Table of all org users showing email, active/pending status badge, global roles as pills, join date. Invite User button opens modal. Invite modal: email + role selector → on success shows "Email sent" confirmation with collapsible fallback link. Resend Invite button on pending users regenerates the link and resends the email. Manage Roles button opens role modal — shows Organisation Role section (promote/demote org_admin, self-demotion blocked) and Tool Access section (grant/revoke tool-scoped roles).
+**Admin — Users** — Table of all org users showing email, active/pending status badge, global roles as pills, join date. Invite User button opens modal. Invite modal: email + role selector → on success shows "Email sent" confirmation with collapsible fallback link. Resend Invite button on pending users regenerates the link and resends the email. Manage Roles button opens role modal — shows Organisation Role section (promote/demote org_admin, self-demotion blocked) and Tool Access section. The **Grant Access** dropdown is populated dynamically from `GET /api/admin/tool-roles`, grouped by tool — adding a new tool to the platform automatically adds its roles to this dropdown with no code changes.
+
+**Admin — AI Models** — Manage the AI model catalogue. Displays all configured models with tier badge, API ID, and pricing. Add, edit, or delete any model. Edit form includes model API ID, display name, tier (standard / advanced / premium), provider, emoji, label, tagline, description, input price per 1M tokens, output price per 1M tokens, and context window. **Test** button sends a live probe to the Anthropic API and shows the result inline. **Reset defaults** button restores the three built-in models. API key status banner shows whether `ANTHROPIC_API_KEY` is configured. Changes take effect immediately across the entire platform — no redeploy needed.
 
 **Admin — Email Templates** — Lists all platform and tool email templates grouped by section. Each row shows the subject, description, and available `{{variables}}`. Clicking Edit opens a modal with three tabs: **HTML Source** (edit raw HTML — what email clients display), **Preview** (rendered iframe view of the HTML with placeholders shown as-is), and **Plain Text** (fallback for non-HTML clients, with an Auto-generate from HTML button). Variable chips are clickable — click any chip to insert the placeholder at the cursor position in whichever field is active. Changes are saved to the DB and survive server restarts; defaults are never overwritten on deploy. A Reset to Default button restores the original hardcoded content.
 
@@ -204,25 +316,33 @@ Ported from Curam Vault — same patterns, rebranded for ToolsForge:
 
 **Date & Time** — Proof-of-concept tool demonstrating three access tiers: no role → access denied screen; `datetime_viewer` → date and time; `datetime_extended` (or org_admin) → date, time, timezone, UTC offset, server location. Refresh button re-fetches live server time.
 
+**AI Chat** — Full chat interface using the SSE streaming backbone. Model picker shows only the models the signed-in user is permitted to use for this tool (resolved from their roles). Streaming assistant responses rendered in real time. Token + cost badge shown after each response. Auto-resizing textarea, Shift+Enter for new lines, Stop button to abort mid-stream, New Chat to reset. All org members get Haiku by default; admins grant `chat_advanced` (Sonnet) or `chat_premium` (Opus) per user.
+
+#### Hooks
+
+**`useStream(toolSlug)`** (`client/src/hooks/useStream.js`) — generic SSE streaming hook for AI tools. Uses `fetch` + `ReadableStream` (not `EventSource`, which does not support POST). Exposes `send(messages, modelId, options)`, `stop()`, `reset()`, `streaming`, `content`, `usage`, `error`. Any tool page uses this hook — no tool writes its own SSE reader.
+
 #### Component Structure
 ```
 client/src/
   App.jsx                      # Router, providers, future flags
   main.jsx
   index.css                    # Tailwind + CSS variables + scrollbar
-  themes.js                    # 5 theme definitions + font options
+  themes.js                    # 5 theme definitions + 16 Google Fonts
   providers/
-    ThemeProvider.jsx          # Injects CSS vars on theme/font change
+    ThemeProvider.jsx          # Loads Google Fonts + injects CSS vars on change
     IconProvider.jsx           # Semantic icon map (Lucide)
   store/
     authStore.js               # token, user (incl. profile fields) — persisted
-    settingsStore.js           # theme, font — persisted
+    settingsStore.js           # theme, bodyFont, headingFont — persisted
+  hooks/
+    useStream.js               # Generic SSE streaming hook for AI tools
   utils/
     apiClient.js               # Fetch wrapper — auto-attaches Bearer token
   components/
     AuthGuard.jsx              # Validates token on mount, redirects to /login
     Layout.jsx                 # Top bar + collapsible sidebar + Outlet
-    Sidebar.jsx                # Nav: Home, Admin section (org_admin), Settings
+    Sidebar.jsx                # Nav: Home, Tools section, Admin section (org_admin), Settings
     Toast.jsx                  # Toast context + floating notifications
   pages/
     LoginPage.jsx
@@ -232,9 +352,11 @@ client/src/
     DashboardPage.jsx
     SettingsPage.jsx
     AdminUsersPage.jsx
+    AdminAIModelsPage.jsx
     AdminEmailTemplatesPage.jsx
     AdminLogsPage.jsx
     DateTimePage.jsx
+    ChatPage.jsx
 ```
 
 ---
@@ -250,21 +372,61 @@ server/
     requireToolAccess.js       # Tool gate — any tool-scoped role or org_admin; attaches req.toolAccess
     rateLimit.js               # authLimiter (20 req / 15 min)
   services/
-    permissions.js             # PermissionService — all authorisation logic
+    permissions.js             # PermissionService — all authorisation + model access logic
     invitations.js             # InvitationService — invite + activate + resend flow (sends email)
     email.js                   # EmailService — MailChannels HTTP API; nodemailer SMTP fallback
     emailTemplates.js          # EmailTemplateService — DB-backed template CRUD + {{variable}} render
+    costCalculator.js          # Async cost calculator — reads pricing from DB model catalogue
+    usageLogger.js             # logUsage + checkSpendThresholds + logAndCheck
   utils/
     logger.js                  # Winston logger — console + DB transport (info/warn/error to app_logs)
     emailDefaults.js           # Hardcoded default template content — seeding source + fallback
+    modelCatalogue.js          # Static defaults + async DB-backed model helpers
   routes/
     auth.js                    # register, login, logout, me, profile, change-password, forgot/reset-password
     tools.js                   # GET /api/tools
     datetime.js                # GET /api/tools/datetime — basic or extended by role
+    stream.js                  # SSE streaming + permitted-models for all AI tools
     org.js                     # GET /api/org
-    admin.js                   # users, invite, resend-invite, grant/revoke role, logs, email-templates
+    admin.js                   # users, invite, roles, tool-roles, ai-models, test-model, logs, email-templates
     invitations.js             # GET /api/invitations/:token, POST /api/invitations/accept
 ```
+
+---
+
+## Adding a New Tool
+
+A new tool follows this pattern — no changes to existing admin UI code are needed:
+
+**1. Register the tool in `db.js` `seedDefaults()`:**
+```js
+await client.query(`
+  INSERT INTO tools (slug, name, version, enabled, config)
+  VALUES ('mytool', 'My Tool', '1.0.0', true, $1::jsonb)
+  ON CONFLICT (slug) DO UPDATE SET enabled = true, config = EXCLUDED.config
+`, [JSON.stringify({
+  roleModelAccess: {
+    org_member:       'standard',
+    mytool_advanced:  'advanced',
+  },
+  roles: [
+    { name: 'mytool_advanced', label: 'My Tool — Advanced', scopeId: 'mytool' },
+  ],
+})]);
+```
+
+**2. Seed the tool's roles:**
+```js
+{ name: 'mytool_advanced', description: 'My Tool — advanced model tier' }
+```
+
+**3. Create the route** (`server/routes/mytool.js`) — call `POST /api/tools/mytool/stream` from the client, or use `requireToolAccess('mytool')` for non-AI tools.
+
+**4. Create the page** (`client/src/pages/MyToolPage.jsx`) — use `useStream('mytool')` for streaming, `GET /api/tools/mytool/permitted-models` for the model picker.
+
+**5. Register the route** in `server/index.js` and add the page to `App.jsx` and `Sidebar.jsx`.
+
+The **Grant Access** dropdown in Admin → Users will automatically include the new tool's roles on next page load.
 
 ---
 
@@ -273,6 +435,12 @@ server/
 ### Prerequisites
 - Docker Desktop running
 - Node.js v22
+
+### Environment Variables
+Add `ANTHROPIC_API_KEY` to your `.env` file to enable AI tools:
+```bash
+ANTHROPIC_API_KEY=sk-ant-...
+```
 
 ### Start Database
 ```powershell
@@ -316,6 +484,7 @@ NODE_ENV=development
 APP_URL=http://localhost:5173
 SEED_ADMIN_EMAIL=your@email.com
 SEED_ADMIN_PASSWORD=your-password
+ANTHROPIC_API_KEY=sk-ant-...
 
 # Email — MailChannels HTTP API (primary)
 MAIL_CHANNEL_API_KEY=your-mailchannels-api-key
@@ -345,7 +514,22 @@ docker exec -it toolsforge-db psql -U postgres -d platform_dev -c "SELECT id, em
 
 **View user roles:**
 ```powershell
-docker exec -it toolsforge-db psql -U postgres -d platform_dev -c "SELECT u.email, r.name, ur.scope_type FROM user_roles ur JOIN users u ON u.id = ur.user_id JOIN roles r ON r.id = ur.role_id;"
+docker exec -it toolsforge-db psql -U postgres -d platform_dev -c "SELECT u.email, r.name, ur.scope_type, ur.scope_id FROM user_roles ur JOIN users u ON u.id = ur.user_id JOIN roles r ON r.id = ur.role_id;"
+```
+
+**View tool registry and config:**
+```powershell
+docker exec -it toolsforge-db psql -U postgres -d platform_dev -c "SELECT slug, name, enabled, config FROM tools;"
+```
+
+**View AI model catalogue:**
+```powershell
+docker exec -it toolsforge-db psql -U postgres -d platform_dev -c "SELECT value FROM system_settings WHERE key = 'ai_models';"
+```
+
+**View AI usage logs:**
+```powershell
+docker exec -it toolsforge-db psql -U postgres -d platform_dev -c "SELECT user_id, tool_slug, model_id, input_tokens, output_tokens, cost_usd, created_at FROM usage_logs ORDER BY created_at DESC LIMIT 20;"
 ```
 
 **View pending invitations:**
@@ -453,6 +637,21 @@ if (fs.existsSync(clientDist)) {
 }
 ```
 
+#### 6. SSE over POST — use fetch, not EventSource
+
+The native browser `EventSource` API only supports GET requests. AI tool streaming uses `POST` to send the messages payload. The `useStream` hook reads the response body as a `ReadableStream` via the `fetch` API, parsing `data: {...}\n\n` lines manually. This is the same pattern used in Curam Vault.
+
+#### 7. AI model catalogue — DB-backed with static fallback
+
+The model catalogue is stored in `system_settings` under key `ai_models` as a JSON array. This lets admins add, edit, or remove models without a redeploy. The static `MODEL_CATALOGUE` in `modelCatalogue.js` is only used as the seed on first startup and as a fallback if the DB is unavailable. `costCalculator.js` reads live pricing from the DB, so a pricing update takes effect immediately.
+
+#### 8. Tool config as self-describing contract
+
+Each tool stores both its model access policy (`roleModelAccess`) and its grantable roles (`roles`) in `tools.config` JSONB. This means:
+- `PermissionService.getPermittedModels` needs no knowledge of individual tools
+- The admin Grant Access dropdown (`GET /api/admin/tool-roles`) aggregates dynamically
+- A new tool is fully described by its seed entry — no admin UI code changes required
+
 ### Railway Environment Variables
 
 | Variable | Value |
@@ -461,21 +660,22 @@ if (fs.existsSync(clientDist)) {
 | `APP_URL` | `https://toolsforge-production.up.railway.app` |
 | `SEED_ADMIN_EMAIL` | Admin account email |
 | `SEED_ADMIN_PASSWORD` | Admin account password |
+| `ANTHROPIC_API_KEY` | Anthropic API key — required for all AI tools |
 | `MAIL_CHANNEL_API_KEY` | MailChannels API key (`X-Api-Key` header) |
 | `MAIL_FROM_EMAIL` | From address for all outbound email |
 | `MAIL_FROM_NAME` | From name for all outbound email |
 
 `APP_URL` is used to build invitation and password reset links in emails. It is no longer required for CORS to function correctly.
 
-#### 6. Logging — Morgan + Winston with DB transport
+#### 9. Logging — Morgan + Winston with DB transport
 
 All server logging goes through a single Winston logger (`server/utils/logger.js`).
 
 - **Morgan** middleware logs every HTTP request at `http` level — skips `/api/health` to keep logs clean
 - **Console transport** — coloured + readable in development, JSON in production (Railway parses this cleanly)
 - **DB transport** — writes `info`, `warn`, `error` to the `app_logs` table; `http` request logs are excluded to avoid table bloat
-- Key business events (`info`) are explicitly logged: user login/logout, password change/reset, invitation created, role granted/revoked
-- Errors and warnings are captured automatically wherever `logger.error(...)` / `logger.warn(...)` is called
+- Key business events (`info`) are explicitly logged: user login/logout, password change/reset, invitation created, role granted/revoked, AI usage logged
+- Spend threshold warnings fire `logger.warn` → `app_logs` — visible in Admin → Logs without extra infrastructure
 
 The DB transport uses a lazy `require('../db')` inside `setImmediate` to break the circular dependency between `logger.js` and `db.js`.
 
@@ -494,12 +694,13 @@ Prevents host `node_modules` from polluting the Docker build context. Without th
 
 ## What's Next
 
+- [ ] Usage dashboard — admin view of token spend by user, tool, and model with date range filters (`usage_logs` table is ready)
+- [ ] Per-user spend caps — `user_settings` key for a personal daily/monthly limit checked in `usageLogger.checkSpendThresholds`
 - [ ] Account lockout — per-user failed login counter; lock after N attempts (rate limiting covers IP-based abuse; this closes slow credential-stuffing against known emails)
 - [ ] Active sessions panel — show user where they're logged in, "sign out everywhere" button (`auth_sessions` table is ready)
 - [ ] Audit log — dedicated table for key events (login, role changes, invitations) separate from the application error log
 - [ ] Tool schema isolation — each tool gets its own DB schema
-- [ ] SettingsService — shared service for user + system config reads/writes
 
 ---
 
-**Foundation proven. Tool framework operational.**
+**Foundation proven. Multi-tool AI platform operational.**

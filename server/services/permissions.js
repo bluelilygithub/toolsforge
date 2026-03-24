@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const { getModelsForTierFromDB, TIER_ORDER } = require('../utils/modelCatalogue');
 
 /**
  * PermissionService — single source of truth for all authorization checks.
@@ -107,6 +108,65 @@ const PermissionService = {
    * @param {string} roleName
    * @param {{ type: string, id: string } | null} scope
    */
+  /**
+   * Return the list of models this user may use for a given tool.
+   *
+   * Resolution order:
+   *   1. org_admin always gets all models (premium tier ceiling)
+   *   2. roleModelAccess map in tool config: { roleName: tier }
+   *   3. User's highest permitted tier across all matching roles wins
+   *   4. No matching roles → empty array (tool should block the request)
+   *
+   * @param {number} userId
+   * @param {string} toolSlug
+   * @returns {Promise<Array<{ id, label, tier, ... }>>}
+   */
+  async getPermittedModels(userId, toolSlug) {
+    // org_admin gets everything
+    if (await this.isOrgAdmin(userId)) {
+      return getModelsForTierFromDB('premium');
+    }
+
+    // Load tool config
+    const toolResult = await pool.query(
+      `SELECT config FROM tools WHERE slug = $1 AND enabled = true`,
+      [toolSlug]
+    );
+    if (!toolResult.rows.length) return [];
+
+    const config = toolResult.rows[0].config || {};
+    const roleModelAccess = config.roleModelAccess || {};
+    if (Object.keys(roleModelAccess).length === 0) return [];
+
+    // Get user's roles (global + tool-scoped for this tool)
+    const roles = await this.getUserRoles(userId);
+    const userRoleNames = new Set(roles.map(r => r.name));
+
+    // Find the highest tier any of the user's roles permit
+    let highestTierIndex = -1;
+    for (const [roleName, tier] of Object.entries(roleModelAccess)) {
+      if (userRoleNames.has(roleName)) {
+        const tierIndex = TIER_ORDER.indexOf(tier);
+        if (tierIndex > highestTierIndex) highestTierIndex = tierIndex;
+      }
+    }
+
+    if (highestTierIndex === -1) return [];
+    return getModelsForTierFromDB(TIER_ORDER[highestTierIndex]);
+  },
+
+  /**
+   * Check whether a user is permitted to use a specific model for a tool.
+   * @param {number} userId
+   * @param {string} toolSlug
+   * @param {string} modelId
+   * @returns {Promise<boolean>}
+   */
+  async canUseModel(userId, toolSlug, modelId) {
+    const permitted = await this.getPermittedModels(userId, toolSlug);
+    return permitted.some(m => m.id === modelId);
+  },
+
   async revokeRole(userId, roleName, scope = null) {
     const scopeType = scope?.type ?? 'global';
     const scopeId   = scope?.id?.toString() ?? null;

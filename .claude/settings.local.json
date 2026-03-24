@@ -3,7 +3,8 @@
     "allow": [
       "Bash(npm install:*)",
       "Bash(npm audit:*)",
-      "Bash(npm uninstall:*)"
+      "Bash(npm uninstall:*)",
+      "Bash(grep -rl \"ai_models\\\\|vault_models\\\\|AI Models\\\\|aiModels\" 'C:\\\\Users\\\\micha\\\\Local Sites\\\\curam-protocol\\\\vault' --include=*.js --include=*.jsx)"
     ]
   }
 }

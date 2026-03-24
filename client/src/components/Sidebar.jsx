@@ -61,12 +61,15 @@ function Sidebar({ onClose }) {
       <nav className="flex-1 overflow-y-auto px-2 py-2">
         <NavItem to="/" icon="home" label="Dashboard" active={isActive('/')} />
 
-        {/* Tools will be listed here dynamically as they are installed */}
+        <SectionLabel label="Tools" />
+        <NavItem to="/tools/chat" icon="message-square" label="AI Chat" active={isActive('/tools/chat')} />
+        <NavItem to="/tools/datetime" icon="clock" label="Date & Time" active={isActive('/tools/datetime')} />
 
         {isOrgAdmin && (
           <>
             <SectionLabel label="Admin" />
             <NavItem to="/admin/users" icon="users" label="Users" active={isActive('/admin/users')} />
+            <NavItem to="/admin/ai-models" icon="cpu" label="AI Models" active={isActive('/admin/ai-models')} />
             <NavItem to="/admin/email-templates" icon="mail" label="Email Templates" active={isActive('/admin/email-templates')} />
             <NavItem to="/admin/logs" icon="scroll-text" label="Logs" active={isActive('/admin/logs')} />
           </>

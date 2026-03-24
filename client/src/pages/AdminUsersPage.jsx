@@ -6,11 +6,6 @@ import useAuthStore from '../store/authStore';
 
 const ORG_ROLES = ['org_member', 'org_admin'];
 
-const TOOL_ROLES = [
-  { label: 'Date & Time — Basic',    value: 'datetime_viewer',   scopeId: 'datetime' },
-  { label: 'Date & Time — Extended', value: 'datetime_extended', scopeId: 'datetime' },
-];
-
 function AdminUsersPage() {
   const [users, setUsers]     = useState([]);
   const [loading, setLoading] = useState(true);
@@ -359,6 +354,7 @@ function InviteModal({ onClose, onInvited }) {
 
 function RoleModal({ user, onClose }) {
   const [roles, setRoles]         = useState([]);
+  const [toolRoles, setToolRoles] = useState([]);
   const [loadingRoles, setLoadingRoles] = useState(true);
   const [grantRole, setGrantRole] = useState('');
   const [working, setWorking]     = useState(false);
@@ -375,20 +371,26 @@ function RoleModal({ user, onClose }) {
       .finally(() => setLoadingRoles(false));
   };
 
-  useEffect(() => { fetchRoles(); }, []);
+  useEffect(() => {
+    fetchRoles();
+    api.get('/api/admin/tool-roles')
+      .then(r => r.json())
+      .then(data => setToolRoles(Array.isArray(data) ? data : []))
+      .catch(() => {});
+  }, []);
 
-  const toolRoles   = roles.filter(r => r.scope_type === 'tool');
+  const assignedToolRoles = roles.filter(r => r.scope_type === 'tool');
   const globalRoles = roles.filter(r => r.scope_type === 'global');
   const isAdmin     = globalRoles.some(r => r.name === 'org_admin');
   const isSelf      = currentUser?.id === user.id;
 
   const handleGrant = async () => {
-    const target = TOOL_ROLES.find(r => r.value === grantRole);
+    const target = toolRoles.find(r => r.name === grantRole);
     if (!target) return;
     setWorking(true);
     try {
       const res = await api.post(`/api/admin/users/${user.id}/grant-role`, {
-        roleName: target.value,
+        roleName: target.name,
         scopeType: 'tool',
         scopeId: target.scopeId,
       });
@@ -510,11 +512,11 @@ function RoleModal({ user, onClose }) {
           </p>
           {loadingRoles ? (
             <p className="text-xs" style={{ color: 'var(--color-muted)' }}>Loading…</p>
-          ) : toolRoles.length === 0 ? (
+          ) : assignedToolRoles.length === 0 ? (
             <p className="text-xs" style={{ color: 'var(--color-muted)' }}>No tool access granted.</p>
           ) : (
             <div className="space-y-2">
-              {toolRoles.map(role => (
+              {assignedToolRoles.map(role => (
                 <div
                   key={`${role.name}-${role.scope_id}`}
                   className="flex items-center justify-between px-3 py-2.5 rounded-xl border"
@@ -553,8 +555,18 @@ function RoleModal({ user, onClose }) {
               style={{ background: 'var(--color-bg)', borderColor: 'var(--color-border)', color: grantRole ? 'var(--color-text)' : 'var(--color-muted)' }}
             >
               <option value="" disabled>Select a role…</option>
-              {TOOL_ROLES.map(r => (
-                <option key={r.value} value={r.value}>{r.label}</option>
+              {/* Group by tool name */}
+              {Object.entries(
+                toolRoles.reduce((acc, r) => {
+                  (acc[r.toolName] = acc[r.toolName] || []).push(r);
+                  return acc;
+                }, {})
+              ).map(([toolName, roles]) => (
+                <optgroup key={toolName} label={toolName}>
+                  {roles.map(r => (
+                    <option key={r.name} value={r.name}>{r.label}</option>
+                  ))}
+                </optgroup>
               ))}
             </select>
             <button

@@ -35,6 +35,12 @@ const semanticMap = {
   lock:            { lucide: 'Lock' },
   key:             { lucide: 'Key' },
   sparkles:        { lucide: 'Sparkles' },
+  cpu:             { lucide: 'Cpu' },
+  'scroll-text':   { lucide: 'ScrollText' },
+  clock:           { lucide: 'Clock' },
+  'message-square':{ lucide: 'MessageSquare' },
+  send:            { lucide: 'Send' },
+  square:          { lucide: 'Square' },
 };
 
 const IconContext = createContext(null);
