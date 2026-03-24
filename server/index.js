@@ -4,6 +4,7 @@ const cors = require('cors');
 const { pool, runMigrations } = require('./db');
 const authRoutes        = require('./routes/auth');
 const toolsRoutes       = require('./routes/tools');
+const datetimeRoutes    = require('./routes/datetime');
 const adminRoutes       = require('./routes/admin');
 const orgRoutes         = require('./routes/org');
 const invitationRoutes  = require('./routes/invitations');
@@ -35,8 +36,9 @@ app.get('/api/health', (req, res) => {
 });
 
 // Routes
-app.use('/api/auth',        authRoutes);
-app.use('/api/tools',       toolsRoutes);
+app.use('/api/auth',              authRoutes);
+app.use('/api/tools/datetime',    datetimeRoutes);
+app.use('/api/tools',             toolsRoutes);
 app.use('/api/admin',       adminRoutes);
 app.use('/api/org',         orgRoutes);
 app.use('/api/invitations', invitationRoutes);

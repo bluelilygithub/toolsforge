@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
 import useAuthStore from '../store/authStore';
 import api from '../utils/apiClient';
 
@@ -81,9 +82,9 @@ function DashboardPage() {
 }
 
 function ToolCard({ tool }) {
-  return (
+  const card = (
     <div
-      className="rounded-2xl border p-5 flex flex-col gap-3"
+      className="rounded-2xl border p-5 flex flex-col gap-3 transition-opacity"
       style={{
         background: 'var(--color-surface)',
         borderColor: 'var(--color-border)',
@@ -119,6 +120,10 @@ function ToolCard({ tool }) {
       )}
     </div>
   );
+
+  return tool.enabled
+    ? <Link to={`/tools/${tool.slug}`} className="block hover:opacity-80 transition-opacity">{card}</Link>
+    : card;
 }
 
 export default DashboardPage;

@@ -255,6 +255,27 @@ async function seedDefaults() {
       console.log('Admin role assigned');
     }
 
+    // Register datetime tool
+    await client.query(`
+      INSERT INTO tools (slug, name, version, enabled)
+      VALUES ('datetime', 'Date & Time', '1.0.0', true)
+      ON CONFLICT (slug) DO UPDATE SET enabled = true
+    `);
+
+    // Datetime tool roles
+    for (const role of [
+      { name: 'datetime_viewer',  description: 'View date and time' },
+      { name: 'datetime_extended', description: 'View date, time, and server location' },
+    ]) {
+      await client.query(
+        `INSERT INTO roles (name, description, is_system)
+         VALUES ($1, $2, false)
+         ON CONFLICT (name) DO NOTHING`,
+        [role.name, role.description]
+      );
+    }
+    console.log('Datetime tool registered');
+
   } catch (error) {
     console.error('Seeding failed:', error.message);
     throw error;

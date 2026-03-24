@@ -2,7 +2,7 @@
 
 **Built by:** Michael Barrett
 **Purpose:** Multi-user modular platform — a foundation for building shared tools across an organisation
-**Status:** Foundation complete — auth, roles, permission service, invitation workflow, frontend shell, admin UI
+**Status:** Foundation + first tool — auth, roles, permission service, invitation workflow, frontend shell, admin UI, datetime tool proving tool-scoped permissions end-to-end
 **Stack:** Node.js/Express · PostgreSQL · Docker · Railway · React/Vite · Tailwind CSS
 
 ---
@@ -51,8 +51,9 @@ Admin-controlled user onboarding. No open registration.
 | `createInvitation(email, orgId, roleName, invitedBy)` | Create inactive user + one-time token |
 | `getInvitation(token)` | Validate token, return email |
 | `acceptInvitation(token, passwordHash)` | Set password, activate account |
+| `resendInvitation(userId, invitedBy)` | Invalidate existing unused tokens, issue fresh 48h token |
 
-Flow: admin invites → inactive user + 48h token created → admin copies activation link → user sets password → account activated → logged in immediately.
+Flow: admin invites → inactive user + 48h token created → admin copies activation link → user sets password → account activated → logged in immediately. Admin can resend to regenerate the link at any time while the account is pending.
 
 #### API Endpoints
 
@@ -65,8 +66,13 @@ Flow: admin invites → inactive user + 48h token created → admin copies activ
 | `/api/auth/me` | GET | Yes | Current user with roles |
 | `/api/org` | GET | Yes | Current organisation details |
 | `/api/tools` | GET | Yes | List installed tools |
+| `/api/tools/datetime` | GET | tool role or org_admin | Datetime tool — basic or extended response by role |
 | `/api/admin/users` | GET | org_admin | All users with roles and activation status |
 | `/api/admin/invite` | POST | org_admin | Create invitation, returns activation URL |
+| `/api/admin/users/:id/resend-invite` | POST | org_admin | Regenerate activation link for pending user |
+| `/api/admin/users/:id/roles` | GET | org_admin | All roles for a user (global + tool-scoped) |
+| `/api/admin/users/:id/grant-role` | POST | org_admin | Grant a role at any scope |
+| `/api/admin/users/:id/revoke-role` | POST | org_admin | Revoke a role at any scope |
 | `/api/invitations/:token` | GET | No | Validate invitation token |
 | `/api/invitations/accept` | POST | No | Accept invitation, set password, return session |
 
@@ -82,7 +88,7 @@ Flow: admin invites → inactive user + 48h token created → admin copies activ
 | `users` | Email + bcrypt password hash (nullable until activated) + `is_active` flag |
 | `auth_sessions` | Token-based sessions with expiry |
 | `password_reset_tokens` | One-time tokens for password reset flow (ready, not yet wired) |
-| `roles` | System-defined roles (`org_admin`, `org_member`) + future tool-defined roles |
+| `roles` | System-defined roles (`org_admin`, `org_member`) + tool-defined roles (`datetime_viewer`, `datetime_extended`, …) |
 | `user_roles` | Many-to-many role assignments with contextual scoping (`global` / `tool` / `resource`) |
 | `invitation_tokens` | One-time 48h activation tokens for invited users |
 | `user_settings` | JSONB key/value settings per user |
@@ -119,18 +125,21 @@ Ported from Curam Vault — same patterns, rebranded for ToolsForge:
 | Dashboard | `/` | Authenticated |
 | Settings | `/settings` | Authenticated |
 | Admin — Users | `/admin/users` | org_admin only |
+| Date & Time tool | `/tools/datetime` | datetime role or org_admin |
 
 **Login** — Vault-style card layout. ToolsForge brand mark. Email/password with show/hide toggle.
 
 **Accept Invitation** — Validates token on load. Shows set-password form. On activation, logs user in immediately and redirects to dashboard. Shows clear error for invalid/expired tokens.
 
-**Dashboard** — Displays org name and signed-in user. Tool cards from registry. Empty state placeholder when no tools installed. Admin badge shown for org_admin users.
+**Dashboard** — Displays org name and signed-in user. Tool cards from registry. Enabled tool cards link to their route. Empty state placeholder when no tools installed. Admin badge shown for org_admin users.
 
 **Settings — Profile tab** — Email (read-only), display name, change password with show/hide toggles.
 
 **Settings — Appearance tab** — Live theme picker (5 swatches), font picker.
 
-**Admin — Users** — Table of all org users showing email, active/pending status badge, global roles as pills, join date. Invite User button opens modal. Invite modal: email + role selector → shows copyable 48h activation link on success.
+**Admin — Users** — Table of all org users showing email, active/pending status badge, global roles as pills, join date. Invite User button opens modal. Invite modal: email + role selector → shows copyable 48h activation link on success. Resend Invite button on pending users regenerates the link (invalidates previous). Manage Roles button opens role modal — shows current tool roles, grant/revoke tool-scoped access.
+
+**Date & Time** — Proof-of-concept tool demonstrating three access tiers: no role → access denied screen; `datetime_viewer` → date and time; `datetime_extended` (or org_admin) → date, time, timezone, UTC offset, server location. Refresh button re-fetches live server time.
 
 #### Component Structure
 ```
@@ -158,6 +167,7 @@ client/src/
     DashboardPage.jsx
     SettingsPage.jsx
     AdminUsersPage.jsx
+    DateTimePage.jsx
 ```
 
 ---
@@ -170,15 +180,17 @@ server/
   db.js                        # Schema init, idempotent migrations, seeding
   middleware/
     requireAuth.js             # requireAuth + requireRole (delegates to PermissionService)
+    requireToolAccess.js       # Tool gate — any tool-scoped role or org_admin; attaches req.toolAccess
     rateLimit.js               # authLimiter (20 req / 15 min)
   services/
     permissions.js             # PermissionService — all authorisation logic
-    invitations.js             # InvitationService — invite + activate flow
+    invitations.js             # InvitationService — invite + activate + resend flow
   routes/
     auth.js                    # register, login, logout, me
     tools.js                   # GET /api/tools
+    datetime.js                # GET /api/tools/datetime — basic or extended by role
     org.js                     # GET /api/org
-    admin.js                   # GET /api/admin/users, POST /api/admin/invite
+    admin.js                   # users, invite, resend-invite, grant/revoke role
     invitations.js             # GET /api/invitations/:token, POST /api/invitations/accept
 ```
 
@@ -281,14 +293,14 @@ Railway auto-deploys on push to `main`.
 
 ## What's Next
 
-- [ ] Role Management UI — assign/revoke contextual roles on existing users from the admin panel
+- [ ] Global role management UI — promote/demote org_admin from admin panel (plumbing exists, no UI yet)
 - [ ] Password reset flow — tokens table is ready, needs email service + routes + UI
-- [ ] `requireToolAccess` middleware — check if user can access a specific tool
-- [ ] First tool installation — proves PermissionService end-to-end with a real tool scope
+- [ ] Email service — invitations and password reset currently require manual link copying
 - [ ] Tool schema isolation — each tool gets its own DB schema
 - [ ] SettingsService — shared service for user + system config reads/writes
-- [ ] Email service — needed for invitation emails and password reset (currently activation link is copied manually)
+- [ ] Deploy client to Railway as a separate static service
+- [ ] Update `apiClient.js` to use `VITE_API_URL` for production Railway client deployment
 
 ---
 
-**Foundation complete. Ready to build tools.**
+**Foundation proven. Tool framework operational.**

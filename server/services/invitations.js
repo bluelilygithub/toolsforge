@@ -80,6 +80,42 @@ const InvitationService = {
   },
 
   /**
+   * Resend an invitation for a pending (inactive) user.
+   * Invalidates all existing unused tokens and issues a fresh 48h token.
+   *
+   * @param {number} userId
+   * @param {number} invitedBy  userId of the admin resending
+   * @returns {{ email: string, token: string, expiresAt: Date }}
+   */
+  async resendInvitation(userId, invitedBy) {
+    const userResult = await pool.query(
+      'SELECT id, email FROM users WHERE id = $1 AND is_active = false',
+      [userId]
+    );
+    if (userResult.rows.length === 0) {
+      throw new Error('User not found or already active');
+    }
+    const { email } = userResult.rows[0];
+
+    // Invalidate any existing unused tokens
+    await pool.query(
+      'UPDATE invitation_tokens SET used = true WHERE user_id = $1 AND used = false',
+      [userId]
+    );
+
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + EXPIRY_HOURS * 60 * 60 * 1000);
+
+    await pool.query(
+      `INSERT INTO invitation_tokens (user_id, token, expires_at, invited_by)
+       VALUES ($1, $2, $3, $4)`,
+      [userId, token, expiresAt, invitedBy]
+    );
+
+    return { email, token, expiresAt };
+  },
+
+  /**
    * Accept an invitation — set the user's password and activate the account.
    * @param {string} token
    * @param {string} passwordHash  Pre-hashed password

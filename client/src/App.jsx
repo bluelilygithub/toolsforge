@@ -9,6 +9,7 @@ import DashboardPage from './pages/DashboardPage';
 import SettingsPage from './pages/SettingsPage';
 import AdminUsersPage from './pages/AdminUsersPage';
 import AcceptInvitePage from './pages/AcceptInvitePage';
+import DateTimePage from './pages/DateTimePage';
 
 function App() {
   return (
@@ -23,6 +24,7 @@ function App() {
                 <Route index element={<DashboardPage />} />
                 <Route path="/settings" element={<SettingsPage />} />
                 <Route path="/admin/users" element={<AdminUsersPage />} />
+                <Route path="/tools/datetime" element={<DateTimePage />} />
                 <Route path="*" element={<Navigate to="/" replace />} />
               </Route>
             </Routes>

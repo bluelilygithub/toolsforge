@@ -3,12 +3,19 @@ import { useIcon } from '../providers/IconProvider';
 import { useToast } from '../components/Toast';
 import api from '../utils/apiClient';
 
-const ROLES = ['org_member', 'org_admin'];
+const ORG_ROLES = ['org_member', 'org_admin'];
+
+const TOOL_ROLES = [
+  { label: 'Date & Time — Basic',    value: 'datetime_viewer',   scopeId: 'datetime' },
+  { label: 'Date & Time — Extended', value: 'datetime_extended', scopeId: 'datetime' },
+];
 
 function AdminUsersPage() {
   const [users, setUsers]     = useState([]);
   const [loading, setLoading] = useState(true);
   const [showInvite, setShowInvite] = useState(false);
+  const [manageUser, setManageUser] = useState(null);
+  const [resendUser, setResendUser] = useState(null);
   const getIcon = useIcon();
   const showToast = useToast();
 
@@ -74,7 +81,7 @@ function AdminUsersPage() {
             <table className="w-full text-sm">
               <thead>
                 <tr style={{ background: 'var(--color-surface)', borderBottom: '1px solid var(--color-border)' }}>
-                  {['Email', 'Status', 'Roles', 'Joined'].map(col => (
+                  {['Email', 'Status', 'Roles', 'Joined', ''].map(col => (
                     <th
                       key={col}
                       className="text-left px-4 py-3 text-xs font-semibold uppercase tracking-wider"
@@ -132,6 +139,26 @@ function AdminUsersPage() {
                     <td className="px-4 py-3 text-xs" style={{ color: 'var(--color-muted)' }}>
                       {new Date(u.created_at).toLocaleDateString()}
                     </td>
+                    <td className="px-4 py-3 text-right">
+                      <div className="flex items-center justify-end gap-3">
+                        {!u.is_active && (
+                          <button
+                            onClick={() => setResendUser(u)}
+                            className="text-xs px-2 py-1 rounded-lg hover:opacity-70 transition-opacity"
+                            style={{ color: 'var(--color-muted)' }}
+                          >
+                            Resend Invite
+                          </button>
+                        )}
+                        <button
+                          onClick={() => setManageUser(u)}
+                          className="text-xs px-2 py-1 rounded-lg hover:opacity-70 transition-opacity"
+                          style={{ color: 'var(--color-primary)' }}
+                        >
+                          Manage Roles
+                        </button>
+                      </div>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -144,6 +171,20 @@ function AdminUsersPage() {
         <InviteModal
           onClose={() => setShowInvite(false)}
           onInvited={() => { fetchUsers(); setShowInvite(false); }}
+        />
+      )}
+
+      {manageUser && (
+        <RoleModal
+          user={manageUser}
+          onClose={() => setManageUser(null)}
+        />
+      )}
+
+      {resendUser && (
+        <ResendModal
+          user={resendUser}
+          onClose={() => setResendUser(null)}
         />
       )}
     </div>
@@ -232,7 +273,7 @@ function InviteModal({ onClose, onInvited }) {
                 className="w-full px-3 py-2.5 rounded-xl border text-sm outline-none"
                 style={{ background: 'var(--color-bg)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
               >
-                {ROLES.map(r => (
+                {ORG_ROLES.map(r => (
                   <option key={r} value={r}>{r}</option>
                 ))}
               </select>
@@ -288,6 +329,283 @@ function InviteModal({ onClose, onInvited }) {
               </button>
               <button
                 onClick={onInvited}
+                className="flex-1 py-2.5 rounded-xl text-sm border transition-opacity hover:opacity-70"
+                style={{ borderColor: 'var(--color-border)', color: 'var(--color-muted)' }}
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function RoleModal({ user, onClose }) {
+  const [roles, setRoles]         = useState([]);
+  const [loadingRoles, setLoadingRoles] = useState(true);
+  const [grantRole, setGrantRole] = useState('');
+  const [working, setWorking]     = useState(false);
+  const showToast = useToast();
+  const getIcon = useIcon();
+
+  const fetchRoles = () => {
+    setLoadingRoles(true);
+    api.get(`/api/admin/users/${user.id}/roles`)
+      .then(r => r.json())
+      .then(data => setRoles(Array.isArray(data) ? data : []))
+      .catch(() => showToast('Failed to load roles', 'error'))
+      .finally(() => setLoadingRoles(false));
+  };
+
+  useEffect(() => { fetchRoles(); }, []);
+
+  const toolRoles = roles.filter(r => r.scope_type === 'tool');
+
+  const handleGrant = async () => {
+    const target = TOOL_ROLES.find(r => r.value === grantRole);
+    if (!target) return;
+    setWorking(true);
+    try {
+      const res = await api.post(`/api/admin/users/${user.id}/grant-role`, {
+        roleName: target.value,
+        scopeType: 'tool',
+        scopeId: target.scopeId,
+      });
+      const data = await res.json();
+      if (!res.ok) { showToast(data.error || 'Failed to grant role', 'error'); return; }
+      showToast('Role granted');
+      fetchRoles();
+    } catch {
+      showToast('Network error', 'error');
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  const handleRevoke = async (role) => {
+    setWorking(true);
+    try {
+      const res = await api.post(`/api/admin/users/${user.id}/revoke-role`, {
+        roleName: role.name,
+        scopeType: role.scope_type,
+        scopeId: role.scope_id,
+      });
+      if (!res.ok) { showToast('Failed to revoke role', 'error'); return; }
+      showToast('Role revoked');
+      fetchRoles();
+    } catch {
+      showToast('Network error', 'error');
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center px-4"
+      style={{ background: 'rgba(0,0,0,0.5)' }}
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <div
+        className="w-full max-w-md rounded-2xl border p-6 space-y-5"
+        style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)' }}
+      >
+        <div className="flex items-start justify-between">
+          <div>
+            <h2 className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>
+              Manage Roles
+            </h2>
+            <p className="text-xs mt-0.5" style={{ color: 'var(--color-muted)' }}>{user.email}</p>
+          </div>
+          <button
+            onClick={onClose}
+            className="opacity-50 hover:opacity-100 transition-opacity"
+            style={{ color: 'var(--color-muted)' }}
+          >
+            {getIcon('x', { size: 16 })}
+          </button>
+        </div>
+
+        {/* Current tool roles */}
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-wider mb-2" style={{ color: 'var(--color-muted)' }}>
+            Tool Access
+          </p>
+          {loadingRoles ? (
+            <p className="text-xs" style={{ color: 'var(--color-muted)' }}>Loading…</p>
+          ) : toolRoles.length === 0 ? (
+            <p className="text-xs" style={{ color: 'var(--color-muted)' }}>No tool access granted.</p>
+          ) : (
+            <div className="space-y-2">
+              {toolRoles.map(role => (
+                <div
+                  key={`${role.name}-${role.scope_id}`}
+                  className="flex items-center justify-between px-3 py-2.5 rounded-xl border"
+                  style={{ borderColor: 'var(--color-border)', background: 'var(--color-bg)' }}
+                >
+                  <div>
+                    <p className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>{role.name}</p>
+                    <p className="text-xs" style={{ color: 'var(--color-muted)' }}>
+                      {role.scope_type} · {role.scope_id}
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => handleRevoke(role)}
+                    disabled={working}
+                    className="text-xs px-2 py-1 rounded-lg hover:opacity-70 transition-opacity disabled:opacity-30"
+                    style={{ color: '#ef4444' }}
+                  >
+                    Revoke
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Grant new role */}
+        <div className="pt-1" style={{ borderTop: '1px solid var(--color-border)' }}>
+          <p className="text-xs font-semibold uppercase tracking-wider mb-3 mt-4" style={{ color: 'var(--color-muted)' }}>
+            Grant Access
+          </p>
+          <div className="flex gap-2">
+            <select
+              value={grantRole}
+              onChange={e => setGrantRole(e.target.value)}
+              className="flex-1 px-3 py-2.5 rounded-xl border text-sm outline-none"
+              style={{ background: 'var(--color-bg)', borderColor: 'var(--color-border)', color: grantRole ? 'var(--color-text)' : 'var(--color-muted)' }}
+            >
+              <option value="" disabled>Select a role…</option>
+              {TOOL_ROLES.map(r => (
+                <option key={r.value} value={r.value}>{r.label}</option>
+              ))}
+            </select>
+            <button
+              onClick={handleGrant}
+              disabled={working || !grantRole}
+              className="px-4 py-2.5 rounded-xl text-sm font-semibold text-white transition-opacity hover:opacity-80 disabled:opacity-50"
+              style={{ background: 'var(--color-primary)' }}
+            >
+              Grant
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ResendModal({ user, onClose }) {
+  const [loading, setLoading] = useState(false);
+  const [result, setResult]   = useState(null);
+  const [error, setError]     = useState('');
+  const showToast = useToast();
+  const getIcon = useIcon();
+
+  const handleResend = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const res = await api.post(`/api/admin/users/${user.id}/resend-invite`, {});
+      const data = await res.json();
+      if (!res.ok) { setError(data.error || 'Failed to resend invitation'); return; }
+      setResult(data);
+      showToast('New invitation link generated');
+    } catch {
+      setError('Network error — please try again');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const copyLink = () => {
+    navigator.clipboard.writeText(result.activationUrl);
+    showToast('Link copied to clipboard');
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center px-4"
+      style={{ background: 'rgba(0,0,0,0.5)' }}
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <div
+        className="w-full max-w-md rounded-2xl border p-6 space-y-4"
+        style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)' }}
+      >
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>
+            Resend Invitation
+          </h2>
+          <button
+            onClick={onClose}
+            className="opacity-50 hover:opacity-100 transition-opacity"
+            style={{ color: 'var(--color-muted)' }}
+          >
+            {getIcon('x', { size: 16 })}
+          </button>
+        </div>
+
+        {!result ? (
+          <div className="space-y-4">
+            <p className="text-sm" style={{ color: 'var(--color-muted)' }}>
+              Generate a new 48-hour activation link for{' '}
+              <span style={{ color: 'var(--color-text)', fontWeight: 600 }}>{user.email}</span>.
+              Any previously sent link will be invalidated.
+            </p>
+
+            {error && <p className="text-xs" style={{ color: '#ef4444' }}>{error}</p>}
+
+            <div className="flex gap-2 pt-1">
+              <button
+                type="button"
+                onClick={onClose}
+                className="flex-1 py-2.5 rounded-xl text-sm border transition-opacity hover:opacity-70"
+                style={{ borderColor: 'var(--color-border)', color: 'var(--color-muted)' }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleResend}
+                disabled={loading}
+                className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-white transition-opacity hover:opacity-80 disabled:opacity-50"
+                style={{ background: 'var(--color-primary)' }}
+              >
+                {loading ? 'Generating…' : 'Generate New Link'}
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <p className="text-sm" style={{ color: 'var(--color-muted)' }}>
+              New activation link for{' '}
+              <span style={{ color: 'var(--color-text)', fontWeight: 600 }}>{result.email}</span>:
+            </p>
+
+            <div
+              className="rounded-xl border p-3 text-xs font-mono break-all"
+              style={{ background: 'var(--color-bg)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+            >
+              {result.activationUrl}
+            </div>
+
+            <p className="text-xs" style={{ color: 'var(--color-muted)' }}>
+              Expires: {new Date(result.expiresAt).toLocaleString()}
+            </p>
+
+            <div className="flex gap-2">
+              <button
+                onClick={copyLink}
+                className="flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-sm font-semibold text-white transition-opacity hover:opacity-80"
+                style={{ background: 'var(--color-primary)' }}
+              >
+                {getIcon('copy', { size: 14 })}
+                Copy Link
+              </button>
+              <button
+                onClick={onClose}
                 className="flex-1 py-2.5 rounded-xl text-sm border transition-opacity hover:opacity-70"
                 style={{ borderColor: 'var(--color-border)', color: 'var(--color-muted)' }}
               >
