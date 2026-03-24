@@ -299,19 +299,74 @@ The app is deployed as a single Railway service using a multi-stage Dockerfile:
 
 The Dockerfile lives at the project root. Railway is configured to use it via `railway.json` (`"builder": "DOCKERFILE"`).
 
-### Key Architecture Decision — CORS Scoped to `/api` Only
+### Key Architecture Decisions
 
-CORS middleware is applied **only to `/api` routes**, not globally. Static files are served before CORS runs.
+#### 1. CORS scoped to `/api` only — never global
 
-**Why this matters:** Vite's production build adds `crossorigin` attributes to `<script>` and `<link>` tags, which causes the browser to send an `Origin` header even for same-origin asset requests. If CORS runs globally and the production domain isn't in `allowedOrigins`, every CSS and JS asset returns a 500 error. Scoping CORS to `/api` eliminates this entirely — static files are always same-origin and need no CORS headers.
+CORS middleware must be applied **only to `/api` routes**, not globally.
 
-**The correct order in `server/index.js`:**
+**Why:** Vite's production build adds `crossorigin` to `<script>` and `<link>` tags. This causes the browser to send an `Origin` header even for same-origin asset requests. If CORS runs globally and rejects unknown origins with `new Error(...)`, every CSS and JS asset returns 500. Two rules to follow:
+- Scope CORS to `/api` so static files never touch it
+- Use `callback(null, false)` to deny unknown origins — not `callback(new Error(...))`. The error form triggers Express's error handler and returns 500. The `false` form quietly omits CORS headers and lets the request continue (same-origin requests don't need CORS headers anyway)
+
+#### 2. Middleware order matters
+
 ```
-app.use('/api', cors(...))   ← CORS only for API calls
-express.json()               ← body parsing
-API routes                   ← /api/* handled here, never reach static
-express.static(clientDist)   ← serves asset files
+app.set('trust proxy', 1)    ← must be first (see below)
+app.use('/api', cors(...))   ← CORS only for /api
+app.use(express.json())      ← body parsing
+API routes                   ← /api/* resolved here, never reach static
+express.static(clientDist)   ← serves built assets
 app.get('*', ...)            ← React Router catch-all (last resort)
+```
+
+The catch-all `app.get('*', ...)` must come **after all API routes**. If registered earlier, it intercepts GET requests to `/api/*` and returns `index.html` instead of the API response.
+
+#### 3. Trust proxy on Railway
+
+Railway runs behind a load balancer. Without `app.set('trust proxy', 1)`, all requests appear to come from the same IP. This breaks per-user rate limiting — 20 login attempts from one user would trigger the limiter for everyone. With `trust proxy: 1`, Express reads the real client IP from the `X-Forwarded-For` header.
+
+#### 4. Use a Dockerfile, not railway.json buildCommand
+
+Railway's Railpack builder ignores custom `buildCommand` in `railway.json` for monorepos. Use a multi-stage Dockerfile instead — it gives full control over the build and is reliable across Railway builder versions.
+
+```dockerfile
+# Stage 1 — build React
+FROM node:22-alpine AS client-build
+WORKDIR /app/client
+COPY client/package*.json ./
+RUN npm install --include=dev   # --include=dev required — Vite is a devDependency
+COPY client/ ./
+RUN npm run build
+
+# Stage 2 — run Express
+FROM node:22-alpine
+WORKDIR /app/server
+COPY server/package*.json ./
+RUN npm install --omit=dev
+COPY server/ ./
+COPY --from=client-build /app/client/dist /app/server/public
+EXPOSE 3001
+CMD ["node", "index.js"]
+```
+
+Key points:
+- Use `--include=dev` for the client install — Vite won't exist otherwise
+- Copy built `dist` into `server/public` so Express can find it with `path.join(__dirname, 'public')` — avoids unreliable `../` path traversal
+- Set `"builder": "DOCKERFILE"` in `railway.json` and clear any dashboard build command
+
+#### 5. Serving the React app from Express
+
+Express conditionally serves the frontend if `server/public` exists (i.e. a production build is present). Local dev is unaffected — Vite runs separately and `public/` never exists locally.
+
+```js
+const clientDist = path.join(__dirname, 'public');
+if (fs.existsSync(clientDist)) {
+  app.use(express.static(clientDist));
+  app.get('*', (req, res) =>
+    res.sendFile(path.join(clientDist, 'index.html'))
+  );
+}
 ```
 
 ### Railway Environment Variables
@@ -323,6 +378,8 @@ app.get('*', ...)            ← React Router catch-all (last resort)
 | `SEED_ADMIN_EMAIL` | Admin account email |
 | `SEED_ADMIN_PASSWORD` | Admin account password |
 
+`APP_URL` is used for invitation activation links. It is no longer required for CORS to function correctly.
+
 ### `.dockerignore`
 
 ```
@@ -330,7 +387,7 @@ app.get('*', ...)            ← React Router catch-all (last resort)
 client/dist
 ```
 
-Prevents host `node_modules` from being copied into the Docker build context, which would overwrite the clean Linux install and break native binaries.
+Prevents host `node_modules` from polluting the Docker build context. Without this, a Windows `node_modules` could overwrite the clean Linux install inside the container and break native binaries.
 
 ---
 
