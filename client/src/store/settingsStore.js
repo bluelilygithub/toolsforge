@@ -4,10 +4,12 @@ import { persist } from 'zustand/middleware';
 const useSettingsStore = create(
   persist(
     (set) => ({
-      font:    'DM Sans',
-      theme:   'warm-sand',
-      setFont:  (font)  => set({ font }),
-      setTheme: (theme) => set({ theme }),
+      bodyFont:    'Inter',
+      headingFont: 'Playfair Display',
+      theme:       'warm-sand',
+      setBodyFont:    (bodyFont)    => set({ bodyFont }),
+      setHeadingFont: (headingFont) => set({ headingFont }),
+      setTheme:       (theme)       => set({ theme }),
     }),
     { name: 'toolsforge-settings' }
   )

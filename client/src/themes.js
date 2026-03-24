@@ -46,10 +46,30 @@ export const themes = {
   },
 };
 
-export const fontOptions = [
-  { value: 'DM Sans',        label: 'DM Sans',        style: "'DM Sans', sans-serif" },
-  { value: 'Inter',          label: 'Inter',           style: "'Inter', sans-serif" },
-  { value: 'Lato',           label: 'Lato',            style: "'Lato', sans-serif" },
-  { value: 'Merriweather',   label: 'Merriweather',    style: "'Merriweather', serif" },
-  { value: 'JetBrains Mono', label: 'JetBrains Mono', style: "'JetBrains Mono', monospace" },
+export const googleFonts = [
+  // Sans-serif
+  { value: 'Inter',            label: 'Inter',            stack: "'Inter', sans-serif",          category: 'sans' },
+  { value: 'DM Sans',          label: 'DM Sans',          stack: "'DM Sans', sans-serif",         category: 'sans' },
+  { value: 'Open Sans',        label: 'Open Sans',        stack: "'Open Sans', sans-serif",       category: 'sans' },
+  { value: 'Lato',             label: 'Lato',             stack: "'Lato', sans-serif",            category: 'sans' },
+  { value: 'Nunito',           label: 'Nunito',           stack: "'Nunito', sans-serif",          category: 'sans' },
+  { value: 'Poppins',          label: 'Poppins',          stack: "'Poppins', sans-serif",         category: 'sans' },
+  { value: 'Raleway',          label: 'Raleway',          stack: "'Raleway', sans-serif",         category: 'sans' },
+  { value: 'Montserrat',       label: 'Montserrat',       stack: "'Montserrat', sans-serif",      category: 'sans' },
+  { value: 'Oswald',           label: 'Oswald',           stack: "'Oswald', sans-serif",          category: 'sans' },
+  // Serif
+  { value: 'Lora',             label: 'Lora',             stack: "'Lora', serif",                 category: 'serif' },
+  { value: 'Merriweather',     label: 'Merriweather',     stack: "'Merriweather', serif",         category: 'serif' },
+  { value: 'Playfair Display', label: 'Playfair Display', stack: "'Playfair Display', serif",     category: 'serif' },
+  { value: 'PT Serif',         label: 'PT Serif',         stack: "'PT Serif', serif",             category: 'serif' },
+  { value: 'Crimson Text',     label: 'Crimson Text',     stack: "'Crimson Text', serif",         category: 'serif' },
+  // Monospace
+  { value: 'JetBrains Mono',   label: 'JetBrains Mono',  stack: "'JetBrains Mono', monospace",   category: 'mono' },
+  { value: 'Fira Code',        label: 'Fira Code',        stack: "'Fira Code', monospace",        category: 'mono' },
+];
+
+export const FONT_CATEGORIES = [
+  { key: 'sans',  label: 'Sans-serif' },
+  { key: 'serif', label: 'Serif' },
+  { key: 'mono',  label: 'Monospace' },
 ];

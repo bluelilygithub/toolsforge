@@ -140,6 +140,23 @@ async function initializeSchema() {
       )
     `);
 
+    // Email templates — admin-editable subject + body for platform and tool emails
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS email_templates (
+        id SERIAL PRIMARY KEY,
+        slug TEXT UNIQUE NOT NULL,
+        tool_slug TEXT,
+        subject TEXT NOT NULL,
+        body_html TEXT NOT NULL,
+        body_text TEXT NOT NULL,
+        description TEXT,
+        variables TEXT[] DEFAULT '{}',
+        updated_by INTEGER REFERENCES users(id),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+
     // Application logs — warn and error entries from Winston
     await client.query(`
       CREATE TABLE IF NOT EXISTS app_logs (
@@ -317,6 +334,19 @@ async function seedDefaults() {
       );
     }
     logger.info('Datetime tool registered');
+
+    // Seed default email templates (do not overwrite admin edits)
+    const TEMPLATE_DEFAULTS = require('./utils/emailDefaults');
+    for (const tmpl of Object.values(TEMPLATE_DEFAULTS)) {
+      await client.query(
+        `INSERT INTO email_templates (slug, tool_slug, subject, body_html, body_text, description, variables)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (slug) DO NOTHING`,
+        [tmpl.slug, tmpl.tool_slug, tmpl.subject, tmpl.body_html, tmpl.body_text,
+         tmpl.description, tmpl.variables]
+      );
+    }
+    logger.info('Email templates seeded');
 
   } catch (error) {
     logger.error('Seeding failed', { error: error.message });

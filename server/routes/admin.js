@@ -3,6 +3,7 @@ const { pool } = require('../db');
 const { requireAuth, requireRole } = require('../middleware/requireAuth');
 const InvitationService = require('../services/invitations');
 const PermissionService = require('../services/permissions');
+const EmailTemplateService = require('../services/emailTemplates');
 const logger = require('../utils/logger');
 
 const router = express.Router();
@@ -193,6 +194,61 @@ router.get('/logs', async (req, res) => {
   } catch (error) {
     logger.error('Fetch logs error', { error: error.message });
     res.status(500).json({ error: 'Failed to fetch logs' });
+  }
+});
+
+// Email templates
+router.get('/email-templates', async (req, res) => {
+  try {
+    const templates = await EmailTemplateService.list();
+    res.json(templates);
+  } catch (error) {
+    logger.error('Fetch email templates error', { error: error.message });
+    res.status(500).json({ error: 'Failed to fetch email templates' });
+  }
+});
+
+router.get('/email-templates/:slug', async (req, res) => {
+  try {
+    const template = await EmailTemplateService.get(req.params.slug);
+    if (!template) return res.status(404).json({ error: 'Template not found' });
+    res.json(template);
+  } catch (error) {
+    logger.error('Fetch email template error', { error: error.message });
+    res.status(500).json({ error: 'Failed to fetch email template' });
+  }
+});
+
+router.put('/email-templates/:slug', async (req, res) => {
+  const { subject, body_html, body_text } = req.body;
+  if (!subject || !body_html || !body_text) {
+    return res.status(400).json({ error: 'subject, body_html, and body_text are required' });
+  }
+  try {
+    logger.info('Email template PUT received', {
+      slug: req.params.slug,
+      subject,
+      body_html_len: body_html?.length,
+      body_text_len: body_text?.length,
+    });
+    await EmailTemplateService.upsert(req.params.slug, { subject, body_html, body_text }, req.user.id);
+    logger.info('Email template updated', { slug: req.params.slug, updatedBy: req.user.email });
+    res.json({ message: 'Template updated' });
+  } catch (error) {
+    logger.error('Update email template error', { error: error.message });
+    res.status(500).json({ error: 'Failed to update email template' });
+  }
+});
+
+router.post('/email-templates/:slug/reset', async (req, res) => {
+  try {
+    await EmailTemplateService.reset(req.params.slug, req.user.id);
+    logger.info('Email template reset to default', { slug: req.params.slug, resetBy: req.user.email });
+    res.json({ message: 'Template reset to default' });
+  } catch (error) {
+    logger.error('Reset email template error', { error: error.message });
+    const status = error.message.startsWith('No default') ? 404 : 500;
+    res.status(status).json({ error: error.message || 'Failed to reset email template' });
   }
 });
 

@@ -67,6 +67,7 @@ function Sidebar({ onClose }) {
           <>
             <SectionLabel label="Admin" />
             <NavItem to="/admin/users" icon="users" label="Users" active={isActive('/admin/users')} />
+            <NavItem to="/admin/email-templates" icon="mail" label="Email Templates" active={isActive('/admin/email-templates')} />
             <NavItem to="/admin/logs" icon="scroll-text" label="Logs" active={isActive('/admin/logs')} />
           </>
         )}

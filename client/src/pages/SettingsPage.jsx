@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import useSettingsStore from '../store/settingsStore';
 import useAuthStore from '../store/authStore';
-import { themes, fontOptions } from '../themes';
+import { themes, googleFonts, FONT_CATEGORIES } from '../themes';
 import { useToast } from '../components/Toast';
 import { useIcon } from '../providers/IconProvider';
 import api from '../utils/apiClient';
@@ -10,7 +10,7 @@ const TABS = ['Profile', 'Appearance'];
 
 function SettingsPage() {
   const [tab, setTab] = useState('Profile');
-  const { font, theme, setFont, setTheme } = useSettingsStore();
+  const { bodyFont, headingFont, theme, setBodyFont, setHeadingFont, setTheme } = useSettingsStore();
   const { user, setAuth, token } = useAuthStore();
   const showToast = useToast();
   const getIcon = useIcon();
@@ -252,28 +252,136 @@ function SettingsPage() {
             </div>
           </Section>
 
-          <Section title="Font">
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-              {fontOptions.map(f => (
-                <button
-                  key={f.value}
-                  onClick={() => setFont(f.value)}
-                  className="rounded-xl border px-4 py-2.5 text-left text-sm transition-all"
-                  style={{
-                    fontFamily: f.style,
-                    background: font === f.value ? `rgba(var(--color-primary-rgb), 0.08)` : 'var(--color-bg)',
-                    borderColor: font === f.value ? 'var(--color-primary)' : 'var(--color-border)',
-                    color: font === f.value ? 'var(--color-primary)' : 'var(--color-text)',
-                    fontWeight: font === f.value ? 600 : 400,
-                  }}
-                >
-                  {f.label}
-                </button>
-              ))}
-            </div>
+          <Section title="Fonts">
+            <FontSection
+              bodyFont={bodyFont}
+              headingFont={headingFont}
+              setBodyFont={setBodyFont}
+              setHeadingFont={setHeadingFont}
+            />
           </Section>
         </div>
       )}
+    </div>
+  );
+}
+
+function FontSection({ bodyFont, headingFont, setBodyFont, setHeadingFont }) {
+  const [fontTab, setFontTab] = useState('body');
+  return (
+    <div>
+      {/* Tab strip */}
+      <div
+        className="flex gap-1 p-1 rounded-xl mb-4"
+        style={{ background: 'var(--color-bg)', border: '1px solid var(--color-border)' }}
+      >
+        {[
+          { key: 'body',    label: 'Body Font',    value: bodyFont },
+          { key: 'heading', label: 'Heading Font', value: headingFont },
+        ].map(t => (
+          <button
+            key={t.key}
+            onClick={() => setFontTab(t.key)}
+            className="flex-1 flex flex-col items-center py-2 px-3 rounded-lg transition-all"
+            style={{
+              background:  fontTab === t.key ? 'var(--color-surface)' : 'transparent',
+              boxShadow:   fontTab === t.key ? '0 1px 3px rgba(0,0,0,0.08)' : 'none',
+              border:      fontTab === t.key ? '1px solid var(--color-border)' : '1px solid transparent',
+            }}
+          >
+            <span
+              className="text-xs font-semibold uppercase tracking-wider"
+              style={{ color: fontTab === t.key ? 'var(--color-primary)' : 'var(--color-muted)' }}
+            >
+              {t.label}
+            </span>
+            <span
+              className="text-sm font-medium mt-0.5 truncate max-w-full"
+              style={{
+                fontFamily: googleFonts.find(f => f.value === t.value)?.stack,
+                color: 'var(--color-text)',
+              }}
+            >
+              {t.value}
+            </span>
+          </button>
+        ))}
+      </div>
+
+      {fontTab === 'body' ? (
+        <FontPicker
+          value={bodyFont}
+          onChange={setBodyFont}
+          sample="The quick brown fox jumps over the lazy dog"
+          sampleSize={13}
+        />
+      ) : (
+        <FontPicker
+          value={headingFont}
+          onChange={setHeadingFont}
+          sample="The Quick Brown Fox"
+          sampleSize={16}
+        />
+      )}
+    </div>
+  );
+}
+
+function FontPicker({ value, onChange, sample, sampleSize }) {
+  return (
+    <div className="space-y-3">
+      {FONT_CATEGORIES.map(cat => {
+        const fonts = googleFonts.filter(f => f.category === cat.key);
+        return (
+          <div key={cat.key}>
+            <p
+              className="text-xs font-semibold uppercase tracking-wider mb-1.5"
+              style={{ color: 'var(--color-muted)' }}
+            >
+              {cat.label}
+            </p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              {fonts.map(f => {
+                const active = value === f.value;
+                return (
+                  <button
+                    key={f.value}
+                    onClick={() => onChange(f.value)}
+                    className="rounded-xl border px-4 py-2.5 text-left transition-all"
+                    style={{
+                      background:   active ? `rgba(var(--color-primary-rgb), 0.08)` : 'var(--color-bg)',
+                      borderColor:  active ? 'var(--color-primary)' : 'var(--color-border)',
+                    }}
+                  >
+                    <p
+                      style={{
+                        fontFamily: f.stack,
+                        fontSize:   sampleSize,
+                        color:      active ? 'var(--color-primary)' : 'var(--color-text)',
+                        fontWeight: 600,
+                        marginBottom: 2,
+                        lineHeight: 1.3,
+                      }}
+                    >
+                      {f.label}
+                    </p>
+                    <p
+                      style={{
+                        fontFamily: f.stack,
+                        fontSize:   11,
+                        color:      'var(--color-muted)',
+                        lineHeight: 1.4,
+                      }}
+                    >
+                      {sample}
+                    </p>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }

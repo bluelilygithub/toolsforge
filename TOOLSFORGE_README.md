@@ -2,7 +2,7 @@
 
 **Built by:** Michael Barrett
 **Purpose:** Multi-user modular platform — a foundation for building shared tools across an organisation
-**Status:** Foundation complete — auth, roles, permission service, invitation workflow, email delivery, password reset, profile management, password history, structured logging, in-app log viewer, admin UI, datetime tool proving tool-scoped permissions end-to-end
+**Status:** Foundation complete — auth, roles, permission service, invitation workflow, email delivery, password reset, profile management, password history, structured logging, in-app log viewer, email template management, admin UI, datetime tool proving tool-scoped permissions end-to-end
 **Stack:** Node.js/Express · PostgreSQL · Docker · Railway · React/Vite · Tailwind CSS
 
 ---
@@ -63,12 +63,33 @@ Sends transactional email via MailChannels HTTP API. Falls back to SMTP (nodemai
 
 | Method | Description |
 |---|---|
-| `sendInvitation(to, activationUrl)` | Branded HTML + plain text invitation email |
-| `sendPasswordReset(to, resetUrl)` | Branded HTML + plain text password reset email |
+| `sendInvitation(to, activationUrl)` | Invitation email — content driven by `invitation` template |
+| `sendPasswordReset(to, resetUrl)` | Password reset email — content driven by `password_reset` template |
+| `send({ to, subject, html, text })` | Raw send — for tools that compose their own email content |
 
 - Uses `X-Api-Key` header for MailChannels authentication
+- All email body content is loaded from `EmailTemplateService` — never hardcoded in routes
 - Email calls are non-blocking — a failure logs an error but never fails the invitation/reset request
 - From address and name configurable via `MAIL_FROM_EMAIL` / `MAIL_FROM_NAME` env vars
+
+#### EmailTemplateService (`server/services/emailTemplates.js`)
+Manages admin-editable email templates stored in the `email_templates` table. Provides a fallback to hardcoded defaults if a DB record is missing.
+
+| Method | Description |
+|---|---|
+| `get(slug)` | Fetch template by slug from DB; fall back to `emailDefaults.js` if not found |
+| `render(slug, vars)` | Fetch template and substitute `{{variable}}` placeholders with provided values |
+| `list()` | All templates ordered by tool (platform templates first) |
+| `upsert(slug, data, updatedBy)` | Save subject, body_html, body_text — creates row if missing, updates if exists |
+| `reset(slug, updatedBy)` | Restore template content to hardcoded default |
+
+Templates use `{{variableName}}` placeholder syntax replaced at send time. Each template declares its available variables (e.g. `activationUrl`, `resetUrl`, `email`).
+
+**Adding a template for a new tool:**
+1. Add a default entry to `server/utils/emailDefaults.js` with `tool_slug` set to the tool's slug
+2. On next server start, the template is seeded into `email_templates` with `ON CONFLICT DO NOTHING` (admin edits are never overwritten)
+3. In tool code, call `EmailTemplateService.render('my_slug', { var1, var2 })` then `send({ to, ...result })`
+4. Admin can edit the template content at any time via **Admin → Email Templates** — no code deploy needed
 
 #### API Endpoints
 
@@ -94,6 +115,10 @@ Sends transactional email via MailChannels HTTP API. Falls back to SMTP (nodemai
 | `/api/admin/users/:id/grant-role` | POST | org_admin | Grant a role at any scope |
 | `/api/admin/users/:id/revoke-role` | POST | org_admin | Revoke a role at any scope |
 | `/api/admin/logs` | GET | org_admin | Paginated app logs — filter by level and message |
+| `/api/admin/email-templates` | GET | org_admin | List all email templates |
+| `/api/admin/email-templates/:slug` | GET | org_admin | Get single template with full HTML and plain text body |
+| `/api/admin/email-templates/:slug` | PUT | org_admin | Update template subject, body_html, body_text |
+| `/api/admin/email-templates/:slug/reset` | POST | org_admin | Reset template to hardcoded default content |
 | `/api/invitations/:token` | GET | No | Validate invitation token |
 | `/api/invitations/accept` | POST | No | Accept invitation, set password, return session |
 
@@ -117,6 +142,7 @@ Sends transactional email via MailChannels HTTP API. Falls back to SMTP (nodemai
 | `system_settings` | Admin-managed global configuration |
 | `tools` | Tool registry — slug, name, version, enabled flag, schema name |
 | `app_logs` | Server log entries (info, warn, error) written by Winston DB transport |
+| `email_templates` | Admin-editable email templates — slug, subject, body_html, body_text, variables array, tool_slug |
 
 #### Key Design Decisions
 - `users.password_hash` is nullable — invited users have no password until they activate
@@ -152,6 +178,7 @@ Ported from Curam Vault — same patterns, rebranded for ToolsForge:
 | Dashboard | `/` | Authenticated |
 | Settings | `/settings` | Authenticated |
 | Admin — Users | `/admin/users` | org_admin only |
+| Admin — Email Templates | `/admin/email-templates` | org_admin only |
 | Admin — Logs | `/admin/logs` | org_admin only |
 | Date & Time tool | `/tools/datetime` | datetime role or org_admin |
 
@@ -170,6 +197,8 @@ Ported from Curam Vault — same patterns, rebranded for ToolsForge:
 **Settings — Appearance tab** — Live theme picker (5 swatches), font picker.
 
 **Admin — Users** — Table of all org users showing email, active/pending status badge, global roles as pills, join date. Invite User button opens modal. Invite modal: email + role selector → on success shows "Email sent" confirmation with collapsible fallback link. Resend Invite button on pending users regenerates the link and resends the email. Manage Roles button opens role modal — shows Organisation Role section (promote/demote org_admin, self-demotion blocked) and Tool Access section (grant/revoke tool-scoped roles).
+
+**Admin — Email Templates** — Lists all platform and tool email templates grouped by section. Each row shows the subject, description, and available `{{variables}}`. Clicking Edit opens a modal with three tabs: **HTML Source** (edit raw HTML — what email clients display), **Preview** (rendered iframe view of the HTML with placeholders shown as-is), and **Plain Text** (fallback for non-HTML clients, with an Auto-generate from HTML button). Variable chips are clickable — click any chip to insert the placeholder at the cursor position in whichever field is active. Changes are saved to the DB and survive server restarts; defaults are never overwritten on deploy. A Reset to Default button restores the original hardcoded content.
 
 **Admin — Logs** — Paginated table of server log entries (info, warn, error). Level filter tabs, message search, expandable metadata rows, auto-refresh toggle (15s), pagination (50 per page).
 
@@ -203,6 +232,7 @@ client/src/
     DashboardPage.jsx
     SettingsPage.jsx
     AdminUsersPage.jsx
+    AdminEmailTemplatesPage.jsx
     AdminLogsPage.jsx
     DateTimePage.jsx
 ```
@@ -223,14 +253,16 @@ server/
     permissions.js             # PermissionService — all authorisation logic
     invitations.js             # InvitationService — invite + activate + resend flow (sends email)
     email.js                   # EmailService — MailChannels HTTP API; nodemailer SMTP fallback
+    emailTemplates.js          # EmailTemplateService — DB-backed template CRUD + {{variable}} render
   utils/
     logger.js                  # Winston logger — console + DB transport (info/warn/error to app_logs)
+    emailDefaults.js           # Hardcoded default template content — seeding source + fallback
   routes/
     auth.js                    # register, login, logout, me, profile, change-password, forgot/reset-password
     tools.js                   # GET /api/tools
     datetime.js                # GET /api/tools/datetime — basic or extended by role
     org.js                     # GET /api/org
-    admin.js                   # users, invite, resend-invite, grant/revoke role, logs
+    admin.js                   # users, invite, resend-invite, grant/revoke role, logs, email-templates
     invitations.js             # GET /api/invitations/:token, POST /api/invitations/accept
 ```
 

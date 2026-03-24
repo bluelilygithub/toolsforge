@@ -1,8 +1,8 @@
 import { useEffect } from 'react';
 import useSettingsStore from '../store/settingsStore';
-import { themes } from '../themes';
+import { themes, googleFonts } from '../themes';
 
-const loadedFonts = new Set(['DM Sans']);
+const loadedFonts = new Set();
 
 function loadFont(fontName) {
   if (loadedFonts.has(fontName)) return;
@@ -13,14 +13,19 @@ function loadFont(fontName) {
   document.head.appendChild(link);
 }
 
+function stackFor(fontName) {
+  return googleFonts.find(f => f.value === fontName)?.stack || `'${fontName}', sans-serif`;
+}
+
 function hexToRgb(hex) {
   const h = hex.replace('#', '');
   return `${parseInt(h.slice(0,2),16)},${parseInt(h.slice(2,4),16)},${parseInt(h.slice(4,6),16)}`;
 }
 
 function ThemeProvider({ children }) {
-  const theme = useSettingsStore((s) => s.theme);
-  const font  = useSettingsStore((s) => s.font);
+  const theme       = useSettingsStore((s) => s.theme);
+  const bodyFont    = useSettingsStore((s) => s.bodyFont);
+  const headingFont = useSettingsStore((s) => s.headingFont);
 
   useEffect(() => {
     const t = themes[theme] || themes['warm-sand'];
@@ -44,9 +49,14 @@ function ThemeProvider({ children }) {
   }, [theme]);
 
   useEffect(() => {
-    loadFont(font);
-    document.documentElement.style.setProperty('--font-sans', `'${font}', sans-serif`);
-  }, [font]);
+    loadFont(bodyFont);
+    document.documentElement.style.setProperty('--font-body', stackFor(bodyFont));
+  }, [bodyFont]);
+
+  useEffect(() => {
+    loadFont(headingFont);
+    document.documentElement.style.setProperty('--font-heading', stackFor(headingFont));
+  }, [headingFont]);
 
   return children;
 }
