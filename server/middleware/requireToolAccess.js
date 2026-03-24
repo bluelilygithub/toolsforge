@@ -1,4 +1,5 @@
 const PermissionService = require('../services/permissions');
+const logger = require('../utils/logger');
 
 /**
  * Middleware factory — gates a route to users with any tool-scoped role for the given tool,
@@ -32,7 +33,7 @@ function requireToolAccess(toolSlug) {
       next();
 
     } catch (error) {
-      console.error('requireToolAccess error:', error);
+      logger.error('requireToolAccess error', { error: error.message, toolSlug });
       res.status(500).json({ error: 'Authorization check failed' });
     }
   };

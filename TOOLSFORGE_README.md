@@ -2,7 +2,7 @@
 
 **Built by:** Michael Barrett
 **Purpose:** Multi-user modular platform — a foundation for building shared tools across an organisation
-**Status:** Foundation + first tool — auth, roles, permission service, invitation workflow, frontend shell, admin UI, datetime tool proving tool-scoped permissions end-to-end
+**Status:** Foundation complete — auth, roles, permission service, invitation workflow, email delivery, password reset, profile management, password history, structured logging, in-app log viewer, admin UI, datetime tool proving tool-scoped permissions end-to-end
 **Stack:** Node.js/Express · PostgreSQL · Docker · Railway · React/Vite · Tailwind CSS
 
 ---
@@ -16,8 +16,11 @@
 - 7-day token-based sessions (`auth_sessions` table)
 - Admin user auto-seeded from environment variables on every startup
 - New users auto-assigned `org_member` role on registration
-- Login response includes full roles array (not a flat role string)
+- Login response includes full roles array and profile fields (first name, last name, phone)
 - Inactive users (pending invitation) are blocked from logging in
+- Password reset flow — forgot password sends a 1-hour token via email; reset invalidates all active sessions
+- Password history — last 5 hashes stored; reuse blocked on both change-password and reset-password
+- Profile update — first name, last name, phone stored on `users` table; updated via `PUT /api/auth/profile`
 
 #### Security
 - CORS locked to origin whitelist (`APP_URL` env var + localhost dev ports)
@@ -48,12 +51,24 @@ Admin-controlled user onboarding. No open registration.
 
 | Method | Description |
 |---|---|
-| `createInvitation(email, orgId, roleName, invitedBy)` | Create inactive user + one-time token |
+| `createInvitation(email, orgId, roleName, invitedBy)` | Create inactive user + one-time token + send invitation email |
 | `getInvitation(token)` | Validate token, return email |
 | `acceptInvitation(token, passwordHash)` | Set password, activate account |
-| `resendInvitation(userId, invitedBy)` | Invalidate existing unused tokens, issue fresh 48h token |
+| `resendInvitation(userId, invitedBy)` | Invalidate existing unused tokens, issue fresh 48h token + send email |
 
-Flow: admin invites → inactive user + 48h token created → admin copies activation link → user sets password → account activated → logged in immediately. Admin can resend to regenerate the link at any time while the account is pending.
+Flow: admin invites → inactive user + 48h token created → activation email sent automatically → user sets password → account activated → logged in immediately. Admin can resend at any time to regenerate the link. The invite modal shows "Email sent" as the primary result with a collapsible fallback link in case email doesn't arrive.
+
+#### EmailService (`server/services/email.js`)
+Sends transactional email via MailChannels HTTP API. Falls back to SMTP (nodemailer) if `MAIL_CHANNEL_API_KEY` is not set.
+
+| Method | Description |
+|---|---|
+| `sendInvitation(to, activationUrl)` | Branded HTML + plain text invitation email |
+| `sendPasswordReset(to, resetUrl)` | Branded HTML + plain text password reset email |
+
+- Uses `X-Api-Key` header for MailChannels authentication
+- Email calls are non-blocking — a failure logs an error but never fails the invitation/reset request
+- From address and name configurable via `MAIL_FROM_EMAIL` / `MAIL_FROM_NAME` env vars
 
 #### API Endpoints
 
@@ -61,18 +76,24 @@ Flow: admin invites → inactive user + 48h token created → admin copies activ
 |---|---|---|---|
 | `/api/health` | GET | No | Server health check |
 | `/api/auth/register` | POST | No | Create new user (rate limited) |
-| `/api/auth/login` | POST | No | Login, returns token + roles (rate limited) |
+| `/api/auth/login` | POST | No | Login, returns token + roles + profile (rate limited) |
 | `/api/auth/logout` | POST | Yes | Invalidate session token |
-| `/api/auth/me` | GET | Yes | Current user with roles |
+| `/api/auth/me` | GET | Yes | Current user with roles and profile fields |
+| `/api/auth/profile` | PUT | Yes | Update first name, last name, phone |
+| `/api/auth/change-password` | POST | Yes | Change password — checks history, rejects last 5 |
+| `/api/auth/forgot-password` | POST | No | Generate reset token, send email (rate limited) |
+| `/api/auth/reset-password/:token` | GET | No | Validate reset token, return email |
+| `/api/auth/reset-password` | POST | No | Consume token, set new password, invalidate sessions |
 | `/api/org` | GET | Yes | Current organisation details |
 | `/api/tools` | GET | Yes | List installed tools |
 | `/api/tools/datetime` | GET | tool role or org_admin | Datetime tool — basic or extended response by role |
 | `/api/admin/users` | GET | org_admin | All users with roles and activation status |
-| `/api/admin/invite` | POST | org_admin | Create invitation, returns activation URL |
-| `/api/admin/users/:id/resend-invite` | POST | org_admin | Regenerate activation link for pending user |
+| `/api/admin/invite` | POST | org_admin | Create invitation, sends email, returns activation URL |
+| `/api/admin/users/:id/resend-invite` | POST | org_admin | Regenerate activation link, sends email |
 | `/api/admin/users/:id/roles` | GET | org_admin | All roles for a user (global + tool-scoped) |
 | `/api/admin/users/:id/grant-role` | POST | org_admin | Grant a role at any scope |
 | `/api/admin/users/:id/revoke-role` | POST | org_admin | Revoke a role at any scope |
+| `/api/admin/logs` | GET | org_admin | Paginated app logs — filter by level and message |
 | `/api/invitations/:token` | GET | No | Validate invitation token |
 | `/api/invitations/accept` | POST | No | Accept invitation, set password, return session |
 
@@ -85,21 +106,25 @@ Flow: admin invites → inactive user + 48h token created → admin copies activ
 | Table | Description |
 |---|---|
 | `organizations` | Single org; all users and data scoped to it |
-| `users` | Email + bcrypt password hash (nullable until activated) + `is_active` flag |
+| `users` | Email + bcrypt password hash (nullable until activated) + `is_active` flag + `first_name`, `last_name`, `phone` |
 | `auth_sessions` | Token-based sessions with expiry |
-| `password_reset_tokens` | One-time tokens for password reset flow (ready, not yet wired) |
+| `password_reset_tokens` | One-time 1-hour tokens for password reset flow |
+| `password_history` | Last N password hashes per user — reuse blocked on change and reset |
 | `roles` | System-defined roles (`org_admin`, `org_member`) + tool-defined roles (`datetime_viewer`, `datetime_extended`, …) |
 | `user_roles` | Many-to-many role assignments with contextual scoping (`global` / `tool` / `resource`) |
 | `invitation_tokens` | One-time 48h activation tokens for invited users |
 | `user_settings` | JSONB key/value settings per user |
 | `system_settings` | Admin-managed global configuration |
 | `tools` | Tool registry — slug, name, version, enabled flag, schema name |
+| `app_logs` | Server log entries (info, warn, error) written by Winston DB transport |
 
 #### Key Design Decisions
 - `users.password_hash` is nullable — invited users have no password until they activate
 - `users.is_active = false` for invited users — blocks login until activation
 - Roles are never stored on the `users` table — always in `user_roles` with scope
 - `user_roles` unique index uses `COALESCE(scope_id, '')` to handle nullable scope correctly
+- `password_history` stores hashed passwords only — checked with `bcrypt.compare`, never stored in plain text
+- `app_logs` stores `info`, `warn`, `error` — `http` request logs are console-only to avoid table bloat
 
 ---
 
@@ -121,23 +146,32 @@ Ported from Curam Vault — same patterns, rebranded for ToolsForge:
 | Page | Route | Access |
 |---|---|---|
 | Login | `/login` | Public |
+| Forgot Password | `/forgot-password` | Public |
+| Reset Password | `/reset/:token` | Public |
 | Accept Invitation | `/invite/:token` | Public |
 | Dashboard | `/` | Authenticated |
 | Settings | `/settings` | Authenticated |
 | Admin — Users | `/admin/users` | org_admin only |
+| Admin — Logs | `/admin/logs` | org_admin only |
 | Date & Time tool | `/tools/datetime` | datetime role or org_admin |
 
-**Login** — Vault-style card layout. ToolsForge brand mark. Email/password with show/hide toggle.
+**Login** — Vault-style card layout. ToolsForge brand mark. Email/password with show/hide toggle. "Forgot password?" link below sign-in button.
+
+**Forgot Password** — Email input. Always returns success (doesn't reveal whether email is registered). On submit, sends 1-hour reset link via email.
+
+**Reset Password** — Validates token on load. Shows invalid/expired state if token is bad. Set new password form with show/hide toggles and confirm field. On success, redirects to login after 3 seconds.
 
 **Accept Invitation** — Validates token on load. Shows set-password form. On activation, logs user in immediately and redirects to dashboard. Shows clear error for invalid/expired tokens.
 
 **Dashboard** — Displays org name and signed-in user. Tool cards from registry. Enabled tool cards link to their route. Empty state placeholder when no tools installed. Admin badge shown for org_admin users.
 
-**Settings — Profile tab** — Email (read-only), display name, change password with show/hide toggles.
+**Settings — Profile tab** — Email (read-only). First name + last name (side by side) + phone. Change password section with current/new/confirm fields and show/hide toggles. Password reuse of last 5 is blocked server-side.
 
 **Settings — Appearance tab** — Live theme picker (5 swatches), font picker.
 
-**Admin — Users** — Table of all org users showing email, active/pending status badge, global roles as pills, join date. Invite User button opens modal. Invite modal: email + role selector → shows copyable 48h activation link on success. Resend Invite button on pending users regenerates the link (invalidates previous). Manage Roles button opens role modal — shows current tool roles, grant/revoke tool-scoped access.
+**Admin — Users** — Table of all org users showing email, active/pending status badge, global roles as pills, join date. Invite User button opens modal. Invite modal: email + role selector → on success shows "Email sent" confirmation with collapsible fallback link. Resend Invite button on pending users regenerates the link and resends the email. Manage Roles button opens role modal — shows Organisation Role section (promote/demote org_admin, self-demotion blocked) and Tool Access section (grant/revoke tool-scoped roles).
+
+**Admin — Logs** — Paginated table of server log entries (info, warn, error). Level filter tabs, message search, expandable metadata rows, auto-refresh toggle (15s), pagination (50 per page).
 
 **Date & Time** — Proof-of-concept tool demonstrating three access tiers: no role → access denied screen; `datetime_viewer` → date and time; `datetime_extended` (or org_admin) → date, time, timezone, UTC offset, server location. Refresh button re-fetches live server time.
 
@@ -152,7 +186,7 @@ client/src/
     ThemeProvider.jsx          # Injects CSS vars on theme/font change
     IconProvider.jsx           # Semantic icon map (Lucide)
   store/
-    authStore.js               # token, user — persisted
+    authStore.js               # token, user (incl. profile fields) — persisted
     settingsStore.js           # theme, font — persisted
   utils/
     apiClient.js               # Fetch wrapper — auto-attaches Bearer token
@@ -163,10 +197,13 @@ client/src/
     Toast.jsx                  # Toast context + floating notifications
   pages/
     LoginPage.jsx
+    ForgotPasswordPage.jsx
+    ResetPasswordPage.jsx
     AcceptInvitePage.jsx
     DashboardPage.jsx
     SettingsPage.jsx
     AdminUsersPage.jsx
+    AdminLogsPage.jsx
     DateTimePage.jsx
 ```
 
@@ -176,7 +213,7 @@ client/src/
 
 ```
 server/
-  index.js                     # App entry — static serving, CORS (API only), routes, startup
+  index.js                     # App entry — Morgan, CORS (API only), routes, startup
   db.js                        # Schema init, idempotent migrations, seeding
   middleware/
     requireAuth.js             # requireAuth + requireRole (delegates to PermissionService)
@@ -184,13 +221,16 @@ server/
     rateLimit.js               # authLimiter (20 req / 15 min)
   services/
     permissions.js             # PermissionService — all authorisation logic
-    invitations.js             # InvitationService — invite + activate + resend flow
+    invitations.js             # InvitationService — invite + activate + resend flow (sends email)
+    email.js                   # EmailService — MailChannels HTTP API; nodemailer SMTP fallback
+  utils/
+    logger.js                  # Winston logger — console + DB transport (info/warn/error to app_logs)
   routes/
-    auth.js                    # register, login, logout, me
+    auth.js                    # register, login, logout, me, profile, change-password, forgot/reset-password
     tools.js                   # GET /api/tools
     datetime.js                # GET /api/tools/datetime — basic or extended by role
     org.js                     # GET /api/org
-    admin.js                   # users, invite, resend-invite, grant/revoke role
+    admin.js                   # users, invite, resend-invite, grant/revoke role, logs
     invitations.js             # GET /api/invitations/:token, POST /api/invitations/accept
 ```
 
@@ -244,11 +284,23 @@ NODE_ENV=development
 APP_URL=http://localhost:5173
 SEED_ADMIN_EMAIL=your@email.com
 SEED_ADMIN_PASSWORD=your-password
+
+# Email — MailChannels HTTP API (primary)
+MAIL_CHANNEL_API_KEY=your-mailchannels-api-key
+MAIL_FROM_EMAIL=noreply@yourdomain.com
+MAIL_FROM_NAME=ToolsForge
+
+# Email — SMTP fallback (used only if MAIL_CHANNEL_API_KEY is not set)
+SMTP_HOST=smtp.mailchannels.net
+SMTP_PORT=587
+SMTP_USER=your-smtp-username
+SMTP_PASS=your-smtp-password
 ```
 
 **Railway:**
 - Set in Railway dashboard → Service → Variables tab
 - Admin user created/updated on every deploy
+- All email env vars must be set for invitation and password reset emails to send
 
 ---
 
@@ -377,8 +429,25 @@ if (fs.existsSync(clientDist)) {
 | `APP_URL` | `https://toolsforge-production.up.railway.app` |
 | `SEED_ADMIN_EMAIL` | Admin account email |
 | `SEED_ADMIN_PASSWORD` | Admin account password |
+| `MAIL_CHANNEL_API_KEY` | MailChannels API key (`X-Api-Key` header) |
+| `MAIL_FROM_EMAIL` | From address for all outbound email |
+| `MAIL_FROM_NAME` | From name for all outbound email |
 
-`APP_URL` is used for invitation activation links. It is no longer required for CORS to function correctly.
+`APP_URL` is used to build invitation and password reset links in emails. It is no longer required for CORS to function correctly.
+
+#### 6. Logging — Morgan + Winston with DB transport
+
+All server logging goes through a single Winston logger (`server/utils/logger.js`).
+
+- **Morgan** middleware logs every HTTP request at `http` level — skips `/api/health` to keep logs clean
+- **Console transport** — coloured + readable in development, JSON in production (Railway parses this cleanly)
+- **DB transport** — writes `info`, `warn`, `error` to the `app_logs` table; `http` request logs are excluded to avoid table bloat
+- Key business events (`info`) are explicitly logged: user login/logout, password change/reset, invitation created, role granted/revoked
+- Errors and warnings are captured automatically wherever `logger.error(...)` / `logger.warn(...)` is called
+
+The DB transport uses a lazy `require('../db')` inside `setImmediate` to break the circular dependency between `logger.js` and `db.js`.
+
+Admins can view logs at `/admin/logs` — filterable by level, searchable by message, with expandable metadata rows.
 
 ### `.dockerignore`
 
@@ -393,13 +462,11 @@ Prevents host `node_modules` from polluting the Docker build context. Without th
 
 ## What's Next
 
-- [ ] Global role management UI — promote/demote org_admin from admin panel (plumbing exists, no UI yet)
-- [ ] Password reset flow — tokens table is ready, needs email service + routes + UI
-- [ ] Email service — invitations and password reset currently require manual link copying
+- [ ] Account lockout — per-user failed login counter; lock after N attempts (rate limiting covers IP-based abuse; this closes slow credential-stuffing against known emails)
+- [ ] Active sessions panel — show user where they're logged in, "sign out everywhere" button (`auth_sessions` table is ready)
+- [ ] Audit log — dedicated table for key events (login, role changes, invitations) separate from the application error log
 - [ ] Tool schema isolation — each tool gets its own DB schema
 - [ ] SettingsService — shared service for user + system config reads/writes
-- [ ] Deploy client to Railway as a separate static service
-- [ ] Update `apiClient.js` to use `VITE_API_URL` for production Railway client deployment
 
 ---
 

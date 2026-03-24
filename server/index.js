@@ -1,7 +1,9 @@
 require('dotenv').config({ path: '../.env' });
 const express = require('express');
 const cors = require('cors');
+const morgan = require('morgan');
 const path = require('path');
+const logger = require('./utils/logger');
 const { pool, runMigrations } = require('./db');
 const authRoutes        = require('./routes/auth');
 const toolsRoutes       = require('./routes/tools');
@@ -30,6 +32,12 @@ const corsMiddleware = cors({
   },
   credentials: true,
 });
+
+// HTTP request logging — skip health checks to keep logs clean
+app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev', {
+  skip: (req) => req.path === '/api/health',
+  stream: { write: (msg) => logger.http(msg.trim()) },
+}));
 
 // CORS — applied to /api routes only (static assets are same-origin, need no CORS)
 app.use('/api', corsMiddleware);
@@ -64,11 +72,11 @@ async function start() {
   try {
     await runMigrations();
     app.listen(PORT, () => {
-      console.log(`Server running on port ${PORT}`);
-      console.log(`Health: http://localhost:${PORT}/api/health`);
+      logger.info(`Server running on port ${PORT}`);
+      logger.info(`Health: http://localhost:${PORT}/api/health`);
     });
   } catch (error) {
-    console.error('Server failed to start:', error);
+    logger.error('Server failed to start', { error: error.message, stack: error.stack });
     process.exit(1);
   }
 }

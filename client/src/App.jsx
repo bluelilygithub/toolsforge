@@ -8,7 +8,10 @@ import LoginPage from './pages/LoginPage';
 import DashboardPage from './pages/DashboardPage';
 import SettingsPage from './pages/SettingsPage';
 import AdminUsersPage from './pages/AdminUsersPage';
+import AdminLogsPage from './pages/AdminLogsPage';
 import AcceptInvitePage from './pages/AcceptInvitePage';
+import ForgotPasswordPage from './pages/ForgotPasswordPage';
+import ResetPasswordPage from './pages/ResetPasswordPage';
 import DateTimePage from './pages/DateTimePage';
 
 function App() {
@@ -20,10 +23,13 @@ function App() {
             <Routes>
               <Route path="/login" element={<LoginPage />} />
               <Route path="/invite/:token" element={<AcceptInvitePage />} />
+              <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+              <Route path="/reset/:token" element={<ResetPasswordPage />} />
               <Route element={<AuthGuard><Layout /></AuthGuard>}>
                 <Route index element={<DashboardPage />} />
                 <Route path="/settings" element={<SettingsPage />} />
                 <Route path="/admin/users" element={<AdminUsersPage />} />
+                <Route path="/admin/logs" element={<AdminLogsPage />} />
                 <Route path="/tools/datetime" element={<DateTimePage />} />
                 <Route path="*" element={<Navigate to="/" replace />} />
               </Route>

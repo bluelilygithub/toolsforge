@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useIcon } from '../providers/IconProvider';
 import { useToast } from '../components/Toast';
 import api from '../utils/apiClient';
+import useAuthStore from '../store/authStore';
 
 const ORG_ROLES = ['org_member', 'org_admin'];
 
@@ -302,39 +303,53 @@ function InviteModal({ onClose, onInvited }) {
           </form>
         ) : (
           <div className="space-y-4">
-            <p className="text-sm" style={{ color: 'var(--color-muted)' }}>
-              Invitation created for <span style={{ color: 'var(--color-text)', fontWeight: 600 }}>{result.email}</span>.
-              Share this activation link with them:
-            </p>
+            <div className="flex items-start gap-3">
+              <div
+                className="w-8 h-8 rounded-full flex items-center justify-center shrink-0 mt-0.5"
+                style={{ background: 'rgba(34,197,94,0.12)', color: '#16a34a' }}
+              >
+                {getIcon('mail', { size: 15 })}
+              </div>
+              <div>
+                <p className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>
+                  Invitation sent
+                </p>
+                <p className="text-sm mt-0.5" style={{ color: 'var(--color-muted)' }}>
+                  Activation email delivered to <strong>{result.email}</strong>.
+                  Link expires {new Date(result.expiresAt).toLocaleString()}.
+                </p>
+              </div>
+            </div>
 
-            <div
-              className="rounded-xl border p-3 text-xs font-mono break-all"
-              style={{ background: 'var(--color-bg)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+            <details className="text-xs" style={{ color: 'var(--color-muted)' }}>
+              <summary className="cursor-pointer hover:opacity-70 select-none">
+                Copy link manually (if email doesn't arrive)
+              </summary>
+              <div className="mt-2 space-y-2">
+                <div
+                  className="rounded-xl border p-3 font-mono break-all"
+                  style={{ background: 'var(--color-bg)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+                >
+                  {result.activationUrl}
+                </div>
+                <button
+                  onClick={copyLink}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs border transition-opacity hover:opacity-70"
+                  style={{ borderColor: 'var(--color-border)', color: 'var(--color-muted)' }}
+                >
+                  {getIcon('copy', { size: 12 })}
+                  Copy link
+                </button>
+              </div>
+            </details>
+
+            <button
+              onClick={onInvited}
+              className="w-full py-2.5 rounded-xl text-sm font-semibold text-white transition-opacity hover:opacity-80"
+              style={{ background: 'var(--color-primary)' }}
             >
-              {result.activationUrl}
-            </div>
-
-            <p className="text-xs" style={{ color: 'var(--color-muted)' }}>
-              Expires: {new Date(result.expiresAt).toLocaleString()}
-            </p>
-
-            <div className="flex gap-2">
-              <button
-                onClick={copyLink}
-                className="flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-sm font-semibold text-white transition-opacity hover:opacity-80"
-                style={{ background: 'var(--color-primary)' }}
-              >
-                {getIcon('copy', { size: 14 })}
-                Copy Link
-              </button>
-              <button
-                onClick={onInvited}
-                className="flex-1 py-2.5 rounded-xl text-sm border transition-opacity hover:opacity-70"
-                style={{ borderColor: 'var(--color-border)', color: 'var(--color-muted)' }}
-              >
-                Done
-              </button>
-            </div>
+              Done
+            </button>
           </div>
         )}
       </div>
@@ -349,6 +364,7 @@ function RoleModal({ user, onClose }) {
   const [working, setWorking]     = useState(false);
   const showToast = useToast();
   const getIcon = useIcon();
+  const currentUser = useAuthStore(s => s.user);
 
   const fetchRoles = () => {
     setLoadingRoles(true);
@@ -361,7 +377,10 @@ function RoleModal({ user, onClose }) {
 
   useEffect(() => { fetchRoles(); }, []);
 
-  const toolRoles = roles.filter(r => r.scope_type === 'tool');
+  const toolRoles   = roles.filter(r => r.scope_type === 'tool');
+  const globalRoles = roles.filter(r => r.scope_type === 'global');
+  const isAdmin     = globalRoles.some(r => r.name === 'org_admin');
+  const isSelf      = currentUser?.id === user.id;
 
   const handleGrant = async () => {
     const target = TOOL_ROLES.find(r => r.value === grantRole);
@@ -402,6 +421,29 @@ function RoleModal({ user, onClose }) {
     }
   };
 
+  const handleToggleAdmin = async () => {
+    if (isSelf) {
+      showToast('You cannot change your own admin role', 'error');
+      return;
+    }
+    setWorking(true);
+    try {
+      const endpoint = isAdmin ? 'revoke-role' : 'grant-role';
+      const res = await api.post(`/api/admin/users/${user.id}/${endpoint}`, {
+        roleName: 'org_admin',
+        scopeType: 'global',
+      });
+      const data = await res.json();
+      if (!res.ok) { showToast(data.error || 'Failed to update role', 'error'); return; }
+      showToast(isAdmin ? 'Admin role removed' : 'Admin role granted');
+      fetchRoles();
+    } catch {
+      showToast('Network error', 'error');
+    } finally {
+      setWorking(false);
+    }
+  };
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center px-4"
@@ -426,6 +468,39 @@ function RoleModal({ user, onClose }) {
           >
             {getIcon('x', { size: 16 })}
           </button>
+        </div>
+
+        {/* Organisation role */}
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-wider mb-2" style={{ color: 'var(--color-muted)' }}>
+            Organisation Role
+          </p>
+          {loadingRoles ? (
+            <p className="text-xs" style={{ color: 'var(--color-muted)' }}>Loading…</p>
+          ) : (
+            <div
+              className="flex items-center justify-between px-3 py-2.5 rounded-xl border"
+              style={{ borderColor: 'var(--color-border)', background: 'var(--color-bg)' }}
+            >
+              <div>
+                <p className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>
+                  {isAdmin ? 'org_admin' : 'org_member'}
+                </p>
+                <p className="text-xs" style={{ color: 'var(--color-muted)' }}>
+                  {isAdmin ? 'Full admin access' : 'Standard member'}
+                </p>
+              </div>
+              <button
+                onClick={handleToggleAdmin}
+                disabled={working || isSelf}
+                title={isSelf ? 'You cannot change your own admin role' : undefined}
+                className="text-xs px-2 py-1 rounded-lg hover:opacity-70 transition-opacity disabled:opacity-30"
+                style={{ color: isAdmin ? '#ef4444' : 'var(--color-primary)' }}
+              >
+                {isAdmin ? 'Remove admin' : 'Make admin'}
+              </button>
+            </div>
+          )}
         </div>
 
         {/* Current tool roles */}
@@ -579,39 +654,53 @@ function ResendModal({ user, onClose }) {
           </div>
         ) : (
           <div className="space-y-4">
-            <p className="text-sm" style={{ color: 'var(--color-muted)' }}>
-              New activation link for{' '}
-              <span style={{ color: 'var(--color-text)', fontWeight: 600 }}>{result.email}</span>:
-            </p>
+            <div className="flex items-start gap-3">
+              <div
+                className="w-8 h-8 rounded-full flex items-center justify-center shrink-0 mt-0.5"
+                style={{ background: 'rgba(34,197,94,0.12)', color: '#16a34a' }}
+              >
+                {getIcon('mail', { size: 15 })}
+              </div>
+              <div>
+                <p className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>
+                  Invitation resent
+                </p>
+                <p className="text-sm mt-0.5" style={{ color: 'var(--color-muted)' }}>
+                  New activation email delivered to <strong>{result.email}</strong>.
+                  Link expires {new Date(result.expiresAt).toLocaleString()}.
+                </p>
+              </div>
+            </div>
 
-            <div
-              className="rounded-xl border p-3 text-xs font-mono break-all"
-              style={{ background: 'var(--color-bg)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+            <details className="text-xs" style={{ color: 'var(--color-muted)' }}>
+              <summary className="cursor-pointer hover:opacity-70 select-none">
+                Copy link manually (if email doesn't arrive)
+              </summary>
+              <div className="mt-2 space-y-2">
+                <div
+                  className="rounded-xl border p-3 font-mono break-all"
+                  style={{ background: 'var(--color-bg)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+                >
+                  {result.activationUrl}
+                </div>
+                <button
+                  onClick={copyLink}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs border transition-opacity hover:opacity-70"
+                  style={{ borderColor: 'var(--color-border)', color: 'var(--color-muted)' }}
+                >
+                  {getIcon('copy', { size: 12 })}
+                  Copy link
+                </button>
+              </div>
+            </details>
+
+            <button
+              onClick={onClose}
+              className="w-full py-2.5 rounded-xl text-sm font-semibold text-white transition-opacity hover:opacity-80"
+              style={{ background: 'var(--color-primary)' }}
             >
-              {result.activationUrl}
-            </div>
-
-            <p className="text-xs" style={{ color: 'var(--color-muted)' }}>
-              Expires: {new Date(result.expiresAt).toLocaleString()}
-            </p>
-
-            <div className="flex gap-2">
-              <button
-                onClick={copyLink}
-                className="flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-sm font-semibold text-white transition-opacity hover:opacity-80"
-                style={{ background: 'var(--color-primary)' }}
-              >
-                {getIcon('copy', { size: 14 })}
-                Copy Link
-              </button>
-              <button
-                onClick={onClose}
-                className="flex-1 py-2.5 rounded-xl text-sm border transition-opacity hover:opacity-70"
-                style={{ borderColor: 'var(--color-border)', color: 'var(--color-muted)' }}
-              >
-                Done
-              </button>
-            </div>
+              Done
+            </button>
           </div>
         )}
       </div>

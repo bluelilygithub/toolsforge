@@ -16,7 +16,11 @@ function SettingsPage() {
   const getIcon = useIcon();
 
   // Profile
-  const [name, setName]   = useState(user?.name || '');
+  const [profile, setProfile] = useState({
+    firstName: user?.first_name || '',
+    lastName:  user?.last_name  || '',
+    phone:     user?.phone      || '',
+  });
   const [saving, setSaving] = useState(false);
 
   // Password
@@ -29,10 +33,19 @@ function SettingsPage() {
     e.preventDefault();
     setSaving(true);
     try {
-      const res = await api.put('/api/auth/profile', { name });
+      const res = await api.put('/api/auth/profile', {
+        firstName: profile.firstName,
+        lastName:  profile.lastName,
+        phone:     profile.phone,
+      });
       const data = await res.json();
       if (!res.ok) { showToast(data.error || 'Save failed', 'error'); return; }
-      setAuth(token, { ...user, name });
+      setAuth(token, {
+        ...user,
+        first_name: profile.firstName,
+        last_name:  profile.lastName,
+        phone:      profile.phone,
+      });
       showToast('Profile saved');
     } catch {
       showToast('Network error', 'error');
@@ -109,22 +122,57 @@ function SettingsPage() {
             </div>
           </Section>
 
-          {/* Display name */}
-          <Section title="Display Name">
+          {/* Profile fields */}
+          <Section title="Profile">
             <form onSubmit={handleSaveProfile} className="space-y-3">
-              <input
-                type="text"
-                value={name}
-                onChange={e => setName(e.target.value)}
-                placeholder="Your name"
-                className="w-full px-3 py-2.5 rounded-xl border text-sm outline-none"
-                style={{
-                  background: 'var(--color-bg)',
-                  borderColor: 'var(--color-border)',
-                  color: 'var(--color-text)',
-                }}
-              />
-              <SaveButton loading={saving} label="Save Name" />
+              <div className="grid grid-cols-2 gap-3">
+                {[
+                  { key: 'firstName', label: 'First Name', placeholder: 'Jane' },
+                  { key: 'lastName',  label: 'Last Name',  placeholder: 'Smith' },
+                ].map(({ key, label, placeholder }) => (
+                  <div key={key}>
+                    <label
+                      className="block text-xs font-semibold uppercase tracking-wider mb-1.5"
+                      style={{ color: 'var(--color-muted)' }}
+                    >
+                      {label}
+                    </label>
+                    <input
+                      type="text"
+                      value={profile[key]}
+                      onChange={e => setProfile(p => ({ ...p, [key]: e.target.value }))}
+                      placeholder={placeholder}
+                      className="w-full px-3 py-2.5 rounded-xl border text-sm outline-none"
+                      style={{
+                        background: 'var(--color-bg)',
+                        borderColor: 'var(--color-border)',
+                        color: 'var(--color-text)',
+                      }}
+                    />
+                  </div>
+                ))}
+              </div>
+              <div>
+                <label
+                  className="block text-xs font-semibold uppercase tracking-wider mb-1.5"
+                  style={{ color: 'var(--color-muted)' }}
+                >
+                  Phone
+                </label>
+                <input
+                  type="tel"
+                  value={profile.phone}
+                  onChange={e => setProfile(p => ({ ...p, phone: e.target.value }))}
+                  placeholder="+61 400 000 000"
+                  className="w-full px-3 py-2.5 rounded-xl border text-sm outline-none"
+                  style={{
+                    background: 'var(--color-bg)',
+                    borderColor: 'var(--color-border)',
+                    color: 'var(--color-text)',
+                  }}
+                />
+              </div>
+              <SaveButton loading={saving} label="Save Profile" />
             </form>
           </Section>
 

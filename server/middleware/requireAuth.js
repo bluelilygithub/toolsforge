@@ -1,5 +1,6 @@
 const { pool } = require('../db');
 const PermissionService = require('../services/permissions');
+const logger = require('../utils/logger');
 
 async function requireAuth(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
@@ -26,7 +27,7 @@ async function requireAuth(req, res, next) {
     next();
 
   } catch (error) {
-    console.error('Auth middleware error:', error);
+    logger.error('Auth middleware error', { error: error.message });
     res.status(500).json({ error: 'Authentication failed' });
   }
 }
@@ -46,7 +47,7 @@ function requireRole(roleNames, scope = null) {
       }
       next();
     } catch (error) {
-      console.error('requireRole error:', error);
+      logger.error('requireRole error', { error: error.message });
       res.status(500).json({ error: 'Authorization check failed' });
     }
   };

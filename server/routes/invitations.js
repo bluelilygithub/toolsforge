@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const { pool } = require('../db');
 const InvitationService = require('../services/invitations');
+const logger = require('../utils/logger');
 
 const router = express.Router();
 
@@ -15,7 +16,7 @@ router.get('/:token', async (req, res) => {
     }
     res.json({ email: invite.email });
   } catch (error) {
-    console.error('Invitation lookup error:', error);
+    logger.error('Invitation lookup error', { error: error.message });
     res.status(500).json({ error: 'Failed to validate invitation' });
   }
 });
@@ -63,7 +64,7 @@ router.post('/accept', async (req, res) => {
     if (error.message === 'Invalid or expired invitation') {
       return res.status(400).json({ error: error.message });
     }
-    console.error('Accept invitation error:', error);
+    logger.error('Accept invitation error', { error: error.message });
     res.status(500).json({ error: 'Failed to activate account' });
   }
 });

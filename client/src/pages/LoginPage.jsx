@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, Link } from 'react-router-dom';
 import useAuthStore from '../store/authStore';
 import { useIcon } from '../providers/IconProvider';
 
@@ -132,6 +132,16 @@ function LoginPage() {
           >
             {loading ? 'Signing in…' : 'Sign in'}
           </button>
+
+          <div className="text-center">
+            <Link
+              to="/forgot-password"
+              className="text-xs"
+              style={{ color: 'var(--color-muted)' }}
+            >
+              Forgot password?
+            </Link>
+          </div>
         </form>
       </div>
     </div>

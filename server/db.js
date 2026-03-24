@@ -1,5 +1,6 @@
 require('dotenv').config({ path: '../.env' });
 const { Pool } = require('pg');
+const logger = require('./utils/logger');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -7,10 +8,10 @@ const pool = new Pool({
 
 pool.query('SELECT NOW()', (err, res) => {
   if (err) {
-    console.error('Database connection failed:', err.message);
+    logger.error('Database connection failed', { error: err.message });
     process.exit(1);
   } else {
-    console.log('Database connected:', res.rows[0].now);
+    logger.info('Database connected', { timestamp: res.rows[0].now });
   }
 });
 
@@ -139,6 +140,38 @@ async function initializeSchema() {
       )
     `);
 
+    // Application logs — warn and error entries from Winston
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS app_logs (
+        id SERIAL PRIMARY KEY,
+        level TEXT NOT NULL,
+        message TEXT NOT NULL,
+        meta JSONB,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_app_logs_level ON app_logs(level)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_app_logs_created_at ON app_logs(created_at DESC)
+    `);
+
+    // Password history — last N hashes to prevent reuse
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS password_history (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        password_hash TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_password_history_user_id ON password_history(user_id)
+    `);
+
     // Tool registry
     await client.query(`
       CREATE TABLE IF NOT EXISTS tools (
@@ -160,13 +193,22 @@ async function initializeSchema() {
     await client.query(`
       ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL
     `);
+    await client.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT
+    `);
+    await client.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT
+    `);
+    await client.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT
+    `);
 
     await client.query('COMMIT');
-    console.log('Core schema initialized');
+    logger.info('Core schema initialized');
 
   } catch (error) {
     await client.query('ROLLBACK');
-    console.error('Schema initialization failed:', error.message);
+    logger.error('Schema initialization failed', { error: error.message });
     throw error;
   } finally {
     client.release();
@@ -188,7 +230,7 @@ async function seedDefaults() {
         ['Default Organization']
       );
       orgId = orgResult.rows[0].id;
-      console.log('Default organization created');
+      logger.info('Default organization created');
     } else {
       orgId = orgCheck.rows[0].id;
     }
@@ -207,7 +249,7 @@ async function seedDefaults() {
         [role.name, role.description]
       );
     }
-    console.log('System roles seeded');
+    logger.info('System roles seeded');
 
     // Admin user
     const adminEmail = process.env.SEED_ADMIN_EMAIL || 'admin@example.com';
@@ -228,7 +270,7 @@ async function seedDefaults() {
         [orgId, adminEmail, passwordHash]
       );
       adminId = userResult.rows[0].id;
-      console.log(`Admin user created: ${adminEmail}`);
+      logger.info(`Admin user created`, { email: adminEmail });
     } else {
       adminId = userCheck.rows[0].id;
       const passwordHash = await bcrypt.hash(adminPassword, 10);
@@ -236,7 +278,7 @@ async function seedDefaults() {
         `UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2`,
         [passwordHash, adminId]
       );
-      console.log(`Admin user password updated: ${adminEmail}`);
+      logger.info('Admin user password updated', { email: adminEmail });
     }
 
     // Assign org_admin role to admin user (global scope)
@@ -252,7 +294,7 @@ async function seedDefaults() {
          ON CONFLICT (user_id, role_id, scope_type, COALESCE(scope_id, '')) DO NOTHING`,
         [adminId, adminRole.rows[0].id]
       );
-      console.log('Admin role assigned');
+      logger.info('Admin role assigned');
     }
 
     // Register datetime tool
@@ -274,10 +316,10 @@ async function seedDefaults() {
         [role.name, role.description]
       );
     }
-    console.log('Datetime tool registered');
+    logger.info('Datetime tool registered');
 
   } catch (error) {
-    console.error('Seeding failed:', error.message);
+    logger.error('Seeding failed', { error: error.message });
     throw error;
   } finally {
     client.release();
@@ -288,9 +330,9 @@ async function runMigrations() {
   try {
     await initializeSchema();
     await seedDefaults();
-    console.log('All migrations complete');
+    logger.info('All migrations complete');
   } catch (error) {
-    console.error('Migration failed:', error);
+    logger.error('Migration failed', { error: error.message, stack: error.stack });
     process.exit(1);
   }
 }

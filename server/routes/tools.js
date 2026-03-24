@@ -1,6 +1,7 @@
 const express = require('express');
 const { pool } = require('../db');
 const { requireAuth } = require('../middleware/requireAuth');
+const logger = require('../utils/logger');
 
 const router = express.Router();
 
@@ -12,7 +13,7 @@ router.get('/', requireAuth, async (req, res) => {
     );
     res.json(result.rows);
   } catch (error) {
-    console.error('Tools list error:', error);
+    logger.error('Tools list error', { error: error.message });
     res.status(500).json({ error: 'Failed to fetch tools' });
   }
 });

@@ -1,6 +1,8 @@
 const crypto = require('crypto');
 const { pool } = require('../db');
 const PermissionService = require('./permissions');
+const EmailService = require('./email');
+const logger = require('../utils/logger');
 
 const EXPIRY_HOURS = 48;
 
@@ -45,6 +47,11 @@ const InvitationService = {
 
       // Assign initial role after commit — PermissionService uses pool directly
       await PermissionService.grantRole(userId, roleName, null, invitedBy);
+
+      // Send invitation email (non-blocking — don't fail the invitation if email fails)
+      const appUrl = process.env.APP_URL || 'http://localhost:5173';
+      EmailService.sendInvitation(email.toLowerCase(), `${appUrl}/invite/${token}`)
+        .catch(err => logger.error('Failed to send invitation email', { error: err.message }));
 
       return { userId, token, expiresAt };
 
@@ -111,6 +118,11 @@ const InvitationService = {
        VALUES ($1, $2, $3, $4)`,
       [userId, token, expiresAt, invitedBy]
     );
+
+    // Send new invitation email (non-blocking)
+    const appUrl = process.env.APP_URL || 'http://localhost:5173';
+    EmailService.sendInvitation(email, `${appUrl}/invite/${token}`)
+      .catch(err => logger.error('Failed to send resend invitation email', { error: err.message }));
 
     return { email, token, expiresAt };
   },

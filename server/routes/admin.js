@@ -3,6 +3,7 @@ const { pool } = require('../db');
 const { requireAuth, requireRole } = require('../middleware/requireAuth');
 const InvitationService = require('../services/invitations');
 const PermissionService = require('../services/permissions');
+const logger = require('../utils/logger');
 
 const router = express.Router();
 
@@ -35,7 +36,7 @@ router.get('/users', async (req, res) => {
     );
     res.json(result.rows);
   } catch (error) {
-    console.error('Admin users error:', error);
+    logger.error('Admin users error', { error: error.message });
     res.status(500).json({ error: 'Failed to fetch users' });
   }
 });
@@ -64,6 +65,7 @@ router.post('/invite', async (req, res) => {
 
     const appUrl = process.env.APP_URL || 'http://localhost:5173';
 
+    logger.info('Invitation created', { email, invitedBy: req.user.email });
     res.status(201).json({
       message: 'Invitation created',
       email,
@@ -71,7 +73,7 @@ router.post('/invite', async (req, res) => {
       expiresAt,
     });
   } catch (error) {
-    console.error('Invite error:', error);
+    logger.error('Invite error', { error: error.message });
     res.status(500).json({ error: 'Failed to create invitation' });
   }
 });
@@ -91,7 +93,7 @@ router.post('/users/:userId/resend-invite', async (req, res) => {
       expiresAt,
     });
   } catch (error) {
-    console.error('Resend invite error:', error);
+    logger.error('Resend invite error', { error: error.message });
     const status = error.message === 'User not found or already active' ? 400 : 500;
     res.status(status).json({ error: error.message || 'Failed to resend invitation' });
   }
@@ -106,7 +108,7 @@ router.get('/users/:userId/roles', async (req, res) => {
     const roles = await PermissionService.getUserRoles(userId);
     res.json(roles);
   } catch (error) {
-    console.error('Get user roles error:', error);
+    logger.error('Get user roles error', { error: error.message });
     res.status(500).json({ error: 'Failed to fetch roles' });
   }
 });
@@ -122,9 +124,10 @@ router.post('/users/:userId/grant-role', async (req, res) => {
   try {
     const scope = scopeType !== 'global' ? { type: scopeType, id: scopeId } : null;
     await PermissionService.grantRole(userId, roleName, scope, req.user.id);
+    logger.info('Role granted', { userId, roleName, scopeType, scopeId, grantedBy: req.user.email });
     res.json({ message: 'Role granted' });
   } catch (error) {
-    console.error('Grant role error:', error);
+    logger.error('Grant role error', { error: error.message });
     res.status(500).json({ error: 'Failed to grant role' });
   }
 });
@@ -140,10 +143,56 @@ router.post('/users/:userId/revoke-role', async (req, res) => {
   try {
     const scope = scopeType !== 'global' ? { type: scopeType, id: scopeId } : null;
     await PermissionService.revokeRole(userId, roleName, scope);
+    logger.info('Role revoked', { userId, roleName, scopeType, scopeId, revokedBy: req.user.email });
     res.json({ message: 'Role revoked' });
   } catch (error) {
-    console.error('Revoke role error:', error);
+    logger.error('Revoke role error', { error: error.message });
     res.status(500).json({ error: 'Failed to revoke role' });
+  }
+});
+
+// Application logs — warn and error entries
+router.get('/logs', async (req, res) => {
+  const level  = req.query.level  || null;
+  const search = req.query.search || null;
+  const limit  = Math.min(parseInt(req.query.limit  || '100', 10), 500);
+  const offset = parseInt(req.query.offset || '0', 10);
+
+  try {
+    const conditions = [];
+    const params = [];
+
+    if (level && level !== 'all') {
+      params.push(level);
+      conditions.push(`level = $${params.length}`);
+    }
+    if (search) {
+      params.push(`%${search}%`);
+      conditions.push(`message ILIKE $${params.length}`);
+    }
+
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    const [rows, count] = await Promise.all([
+      pool.query(
+        `SELECT id, level, message, meta, created_at
+         FROM app_logs ${where}
+         ORDER BY created_at DESC
+         LIMIT ${limit} OFFSET ${offset}`,
+        params
+      ),
+      pool.query(`SELECT COUNT(*) FROM app_logs ${where}`, params),
+    ]);
+
+    res.json({
+      logs:  rows.rows,
+      total: parseInt(count.rows[0].count, 10),
+      limit,
+      offset,
+    });
+  } catch (error) {
+    logger.error('Fetch logs error', { error: error.message });
+    res.status(500).json({ error: 'Failed to fetch logs' });
   }
 });
 
