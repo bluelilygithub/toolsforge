@@ -176,7 +176,7 @@ client/src/
 
 ```
 server/
-  index.js                     # App entry — CORS, routes, startup
+  index.js                     # App entry — static serving, CORS (API only), routes, startup
   db.js                        # Schema init, idempotent migrations, seeding
   middleware/
     requireAuth.js             # requireAuth + requireRole (delegates to PermissionService)
@@ -288,6 +288,49 @@ git push origin main
 ```
 
 Railway auto-deploys on push to `main`.
+
+### How the Production Build Works
+
+The app is deployed as a single Railway service using a multi-stage Dockerfile:
+
+1. **Stage 1** — builds the React client (`npm run build` via Vite) inside an Alpine Node container
+2. **Stage 2** — sets up the Express server and copies the built `client/dist` into `server/public`
+3. Express serves static files from `server/public` if the directory exists, with a catch-all for React Router
+
+The Dockerfile lives at the project root. Railway is configured to use it via `railway.json` (`"builder": "DOCKERFILE"`).
+
+### Key Architecture Decision — CORS Scoped to `/api` Only
+
+CORS middleware is applied **only to `/api` routes**, not globally. Static files are served before CORS runs.
+
+**Why this matters:** Vite's production build adds `crossorigin` attributes to `<script>` and `<link>` tags, which causes the browser to send an `Origin` header even for same-origin asset requests. If CORS runs globally and the production domain isn't in `allowedOrigins`, every CSS and JS asset returns a 500 error. Scoping CORS to `/api` eliminates this entirely — static files are always same-origin and need no CORS headers.
+
+**The correct order in `server/index.js`:**
+```
+app.use('/api', cors(...))   ← CORS only for API calls
+express.json()               ← body parsing
+API routes                   ← /api/* handled here, never reach static
+express.static(clientDist)   ← serves asset files
+app.get('*', ...)            ← React Router catch-all (last resort)
+```
+
+### Railway Environment Variables
+
+| Variable | Value |
+|---|---|
+| `DATABASE_URL` | PostgreSQL connection string (auto-set by Railway Postgres plugin) |
+| `APP_URL` | `https://toolsforge-production.up.railway.app` |
+| `SEED_ADMIN_EMAIL` | Admin account email |
+| `SEED_ADMIN_PASSWORD` | Admin account password |
+
+### `.dockerignore`
+
+```
+**/node_modules
+client/dist
+```
+
+Prevents host `node_modules` from being copied into the Docker build context, which would overwrite the clean Linux install and break native binaries.
 
 ---
 

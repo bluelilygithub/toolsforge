@@ -29,20 +29,10 @@ const corsMiddleware = cors({
   credentials: true,
 });
 
-app.use(express.json());
-
-// Serve static files first — before CORS, before API routes
-const clientDist = path.join(__dirname, 'public');
-const fs = require('fs');
-if (fs.existsSync(clientDist)) {
-  app.use(express.static(clientDist));
-  app.get('*', (req, res) => {
-    res.sendFile(path.join(clientDist, 'index.html'));
-  });
-}
-
-// Apply CORS only to API routes
+// CORS — applied to /api routes only (static assets are same-origin, need no CORS)
 app.use('/api', corsMiddleware);
+
+app.use(express.json());
 
 // Health check
 app.get('/api/health', (req, res) => {
@@ -56,6 +46,16 @@ app.use('/api/tools',             toolsRoutes);
 app.use('/api/admin',             adminRoutes);
 app.use('/api/org',               orgRoutes);
 app.use('/api/invitations',       invitationRoutes);
+
+// Static files + React Router catch-all — after all API routes so /api/* is never intercepted
+const clientDist = path.join(__dirname, 'public');
+const fs = require('fs');
+if (fs.existsSync(clientDist)) {
+  app.use(express.static(clientDist));
+  app.get('*', (req, res) => {
+    res.sendFile(path.join(clientDist, 'index.html'));
+  });
+}
 
 // Start server
 async function start() {
