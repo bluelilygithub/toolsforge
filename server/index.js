@@ -13,23 +13,36 @@ const invitationRoutes  = require('./routes/invitations');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// CORS — locked to known origins
+// CORS — only applied to API routes (static files are same-origin, no CORS needed)
 const allowedOrigins = [
   process.env.APP_URL,
   'http://localhost:5173',
   'http://localhost:3000',
 ].filter(Boolean);
 
-app.use(cors({
+const corsMiddleware = cors({
   origin: (origin, callback) => {
     if (!origin) return callback(null, true);
     if (allowedOrigins.includes(origin)) return callback(null, true);
     callback(new Error('Not allowed by CORS'));
   },
   credentials: true,
-}));
+});
 
 app.use(express.json());
+
+// Serve static files first — before CORS, before API routes
+const clientDist = path.join(__dirname, 'public');
+const fs = require('fs');
+if (fs.existsSync(clientDist)) {
+  app.use(express.static(clientDist));
+  app.get('*', (req, res) => {
+    res.sendFile(path.join(clientDist, 'index.html'));
+  });
+}
+
+// Apply CORS only to API routes
+app.use('/api', corsMiddleware);
 
 // Health check
 app.get('/api/health', (req, res) => {
@@ -40,22 +53,9 @@ app.get('/api/health', (req, res) => {
 app.use('/api/auth',              authRoutes);
 app.use('/api/tools/datetime',    datetimeRoutes);
 app.use('/api/tools',             toolsRoutes);
-app.use('/api/admin',       adminRoutes);
-app.use('/api/org',         orgRoutes);
-app.use('/api/invitations', invitationRoutes);
-
-// Serve React app if client/dist exists (production build present)
-const clientDist = path.join(__dirname, 'public');
-const fs = require('fs');
-console.log('Static dir:', clientDist);
-console.log('Static dir exists:', fs.existsSync(clientDist));
-if (fs.existsSync(clientDist)) {
-  console.log('Static dir contents:', fs.readdirSync(clientDist));
-  app.use(express.static(clientDist));
-  app.get('*', (req, res) => {
-    res.sendFile(path.join(clientDist, 'index.html'));
-  });
-}
+app.use('/api/admin',             adminRoutes);
+app.use('/api/org',               orgRoutes);
+app.use('/api/invitations',       invitationRoutes);
 
 // Start server
 async function start() {
