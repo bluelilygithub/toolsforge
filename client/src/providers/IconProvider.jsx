@@ -41,6 +41,17 @@ const semanticMap = {
   'message-square':{ lucide: 'MessageSquare' },
   send:            { lucide: 'Send' },
   square:          { lucide: 'Square' },
+  mic:             { lucide: 'Mic' },
+  'volume-2':      { lucide: 'Volume2' },
+  pause:           { lucide: 'Pause' },
+  play:            { lucide: 'Play' },
+  paperclip:       { lucide: 'Paperclip' },
+  'globe':         { lucide: 'Globe' },
+  'map-pin':       { lucide: 'MapPin' },
+  'chevron-up':    { lucide: 'ChevronUp' },
+  file:            { lucide: 'File' },
+  'file-text':     { lucide: 'FileText' },
+  image:           { lucide: 'Image' },
 };
 
 const IconContext = createContext(null);

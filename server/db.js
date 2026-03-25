@@ -245,6 +245,12 @@ async function initializeSchema() {
     await client.query(`
       ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT
     `);
+    await client.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_attempts INTEGER NOT NULL DEFAULT 0
+    `);
+    await client.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ
+    `);
 
     await client.query('COMMIT');
     logger.info('Core schema initialized');
@@ -399,6 +405,31 @@ async function seedDefaults() {
       );
     }
     logger.info('Email templates seeded');
+
+    // Seed default security thresholds (do not overwrite admin edits)
+    for (const [key, value] of [
+      ['security_login_max_attempts', 5],
+      ['security_lockout_minutes',    15],
+      ['security_login_rate_limit',   5],
+    ]) {
+      await client.query(
+        `INSERT INTO system_settings (key, value) VALUES ($1, $2::jsonb) ON CONFLICT (key) DO NOTHING`,
+        [key, JSON.stringify(value)]
+      );
+    }
+    logger.info('Security thresholds seeded');
+
+    // Seed app settings defaults (do not overwrite admin edits)
+    for (const [key, value] of [
+      ['chat_allowed_file_types', '.pdf,.txt,.md,.csv,.json,.js,.jsx,.ts,.tsx,.py,.html,.css,image/*'],
+      ['default_timezone', 'UTC'],
+    ]) {
+      await client.query(
+        `INSERT INTO system_settings (key, value) VALUES ($1, $2::jsonb) ON CONFLICT (key) DO NOTHING`,
+        [key, JSON.stringify(value)]
+      );
+    }
+    logger.info('App settings seeded');
 
     // Seed default spend alert thresholds (do not overwrite admin edits)
     for (const [key, value] of [

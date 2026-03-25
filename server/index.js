@@ -1,5 +1,6 @@
 require('dotenv').config({ path: '../.env' });
 const express = require('express');
+const helmet = require('helmet');
 const cors = require('cors');
 const morgan = require('morgan');
 const path = require('path');
@@ -11,12 +12,16 @@ const datetimeRoutes    = require('./routes/datetime');
 const streamRoutes      = require('./routes/stream');
 const adminRoutes       = require('./routes/admin');
 const orgRoutes         = require('./routes/org');
-const invitationRoutes  = require('./routes/invitations');
+const invitationRoutes   = require('./routes/invitations');
+const userSettingsRoutes = require('./routes/userSettings');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
 app.set('trust proxy', 1);
+
+// Security headers — removes X-Powered-By, sets CSP, HSTS, etc.
+app.use(helmet());
 
 // CORS — only applied to API routes (static files are same-origin, no CORS needed)
 const allowedOrigins = [
@@ -57,7 +62,8 @@ app.use('/api/tools',             streamRoutes);
 app.use('/api/tools',             toolsRoutes);
 app.use('/api/admin',             adminRoutes);
 app.use('/api/org',               orgRoutes);
-app.use('/api/invitations',       invitationRoutes);
+app.use('/api/invitations',        invitationRoutes);
+app.use('/api/user-settings',     userSettingsRoutes);
 
 // Static files + React Router catch-all — after all API routes so /api/* is never intercepted
 const clientDist = path.join(__dirname, 'public');
@@ -73,6 +79,20 @@ if (fs.existsSync(clientDist)) {
 async function start() {
   try {
     await runMigrations();
+
+    // Load security config from DB and apply to rate limiters
+    const { updateRateLimitConfig } = require('./middleware/rateLimit');
+    try {
+      const result = await pool.query(
+        `SELECT key, value FROM system_settings WHERE key = 'security_login_rate_limit'`
+      );
+      for (const row of result.rows) {
+        if (row.key === 'security_login_rate_limit') {
+          updateRateLimitConfig({ loginMax: Number(row.value) || 5 });
+        }
+      }
+    } catch { /* keep defaults */ }
+
     app.listen(PORT, () => {
       logger.info(`Server running on port ${PORT}`);
       logger.info(`Health: http://localhost:${PORT}/api/health`);

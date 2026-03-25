@@ -71,6 +71,8 @@ function Sidebar({ onClose }) {
             <NavItem to="/admin/users" icon="users" label="Users" active={isActive('/admin/users')} />
             <NavItem to="/admin/ai-models" icon="cpu" label="AI Models" active={isActive('/admin/ai-models')} />
             <NavItem to="/admin/email-templates" icon="mail" label="Email Templates" active={isActive('/admin/email-templates')} />
+            <NavItem to="/admin/security" icon="shield" label="Security" active={isActive('/admin/security')} />
+            <NavItem to="/admin/app-settings" icon="globe" label="App Settings" active={isActive('/admin/app-settings')} />
             <NavItem to="/admin/logs" icon="scroll-text" label="Logs" active={isActive('/admin/logs')} />
           </>
         )}

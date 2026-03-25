@@ -1,4 +1,11 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
+
+const TZ_LIST = Intl.supportedValuesOf ? Intl.supportedValuesOf('timeZone') : [
+  'UTC','America/New_York','America/Chicago','America/Denver','America/Los_Angeles',
+  'America/Toronto','Europe/London','Europe/Paris','Europe/Berlin',
+  'Asia/Dubai','Asia/Kolkata','Asia/Singapore','Asia/Tokyo',
+  'Australia/Sydney','Australia/Melbourne','Pacific/Auckland',
+];
 import useSettingsStore from '../store/settingsStore';
 import useAuthStore from '../store/authStore';
 import { themes, googleFonts, FONT_CATEGORIES } from '../themes';
@@ -22,6 +29,39 @@ function SettingsPage() {
     phone:     user?.phone      || '',
   });
   const [saving, setSaving] = useState(false);
+
+  // Timezone
+  const [timezone, setTimezone]         = useState('');
+  const [tzSaving, setTzSaving]         = useState(false);
+  const [tzSaved, setTzSaved]           = useState('');
+
+  useEffect(() => {
+    api.get('/api/user-settings')
+      .then(r => r.json())
+      .then(data => {
+        if (data.timezone) { setTimezone(data.timezone); setTzSaved(data.timezone); }
+        else {
+          // Fall back to org default
+          api.get('/api/admin/app-settings').then(r => r.json())
+            .then(d => { const tz = d.default_timezone || Intl.DateTimeFormat().resolvedOptions().timeZone; setTimezone(tz); setTzSaved(tz); })
+            .catch(() => {});
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  async function handleSaveTimezone() {
+    setTzSaving(true);
+    try {
+      await api.post('/api/user-settings', { key: 'timezone', value: timezone });
+      setTzSaved(timezone);
+      showToast('Timezone saved');
+    } catch {
+      showToast('Failed to save timezone', 'error');
+    } finally {
+      setTzSaving(false);
+    }
+  }
 
   // Password
   const [pwForm, setPwForm] = useState({ current: '', next: '', confirm: '' });
@@ -174,6 +214,40 @@ function SettingsPage() {
               </div>
               <SaveButton loading={saving} label="Save Profile" />
             </form>
+          </Section>
+
+          {/* Timezone */}
+          <Section title="Timezone">
+            <p className="text-xs mb-3" style={{ color: 'var(--color-muted)' }}>
+              Overrides the organisation default. Used for date stamps and date context injected into AI responses.
+            </p>
+            <select
+              value={timezone}
+              onChange={e => setTimezone(e.target.value)}
+              className="w-full px-3 py-2 rounded-xl border text-sm outline-none mb-3"
+              style={{
+                background: 'var(--color-surface)',
+                borderColor: timezone !== tzSaved ? 'var(--color-primary)' : 'var(--color-border)',
+                color: 'var(--color-text)',
+              }}
+            >
+              {TZ_LIST.map(tz => (
+                <option key={tz} value={tz}>{tz.replace(/_/g, ' ')}</option>
+              ))}
+            </select>
+            {timezone && (
+              <p className="text-xs mb-3" style={{ color: 'var(--color-muted)', opacity: 0.7 }}>
+                Current time: {new Date().toLocaleString('en', { timeZone: timezone, dateStyle: 'medium', timeStyle: 'short' })}
+              </p>
+            )}
+            <button
+              onClick={handleSaveTimezone}
+              disabled={tzSaving || timezone === tzSaved}
+              className="px-5 py-2 rounded-xl text-sm font-semibold text-white transition-opacity hover:opacity-80 disabled:opacity-50"
+              style={{ background: 'var(--color-primary)' }}
+            >
+              {tzSaving ? 'Saving…' : 'Save Timezone'}
+            </button>
           </Section>
 
           {/* Change password */}

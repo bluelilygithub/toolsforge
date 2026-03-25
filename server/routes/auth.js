@@ -3,14 +3,14 @@ const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const { pool } = require('../db');
 const { requireAuth } = require('../middleware/requireAuth');
-const { authLimiter } = require('../middleware/rateLimit');
+const { loginLimiter, registerLimiter, resetLimiter } = require('../middleware/rateLimit');
 const EmailService = require('../services/email');
 const logger = require('../utils/logger');
 
 const router = express.Router();
 
 // Register new user
-router.post('/register', authLimiter, async (req, res) => {
+router.post('/register', registerLimiter, async (req, res) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
@@ -64,8 +64,27 @@ router.post('/register', authLimiter, async (req, res) => {
   }
 });
 
-// Login
-router.post('/login', authLimiter, async (req, res) => {
+// Lockout defaults — overridden at login time by system_settings
+const LOCKOUT_DEFAULTS = { maxAttempts: 5, lockoutMinutes: 15 };
+
+async function getLockoutConfig() {
+  try {
+    const result = await pool.query(
+      `SELECT key, value FROM system_settings
+       WHERE key IN ('security_login_max_attempts', 'security_lockout_minutes')`
+    );
+    const cfg = { ...LOCKOUT_DEFAULTS };
+    for (const row of result.rows) {
+      if (row.key === 'security_login_max_attempts') cfg.maxAttempts    = Number(row.value) || LOCKOUT_DEFAULTS.maxAttempts;
+      if (row.key === 'security_lockout_minutes')    cfg.lockoutMinutes = Number(row.value) || LOCKOUT_DEFAULTS.lockoutMinutes;
+    }
+    return cfg;
+  } catch {
+    return LOCKOUT_DEFAULTS;
+  }
+}
+
+router.post('/login', loginLimiter, async (req, res) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
@@ -74,10 +93,13 @@ router.post('/login', authLimiter, async (req, res) => {
 
   try {
     const result = await pool.query(
-      'SELECT id, email, password_hash, is_active, first_name, last_name, phone FROM users WHERE email = $1',
+      `SELECT id, email, password_hash, is_active, first_name, last_name, phone,
+              failed_login_attempts, locked_until
+       FROM users WHERE email = $1`,
       [email.toLowerCase()]
     );
 
+    // Always respond generically — don't reveal whether the email exists
     if (result.rows.length === 0) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
@@ -88,11 +110,41 @@ router.post('/login', authLimiter, async (req, res) => {
       return res.status(401).json({ error: 'Account pending activation — check your invitation email' });
     }
 
+    // Account lockout check
+    if (user.locked_until && new Date(user.locked_until) > new Date()) {
+      const minutesLeft = Math.ceil((new Date(user.locked_until) - new Date()) / 60000);
+      logger.warn('Login blocked — account locked', { email: user.email });
+      return res.status(423).json({
+        error: `Account locked due to too many failed attempts. Try again in ${minutesLeft} minute${minutesLeft === 1 ? '' : 's'}.`,
+      });
+    }
+
     const valid = await bcrypt.compare(password, user.password_hash);
 
     if (!valid) {
+      const { maxAttempts, lockoutMinutes } = await getLockoutConfig();
+      const attempts = (user.failed_login_attempts || 0) + 1;
+      const shouldLock = attempts >= maxAttempts;
+      const lockedUntil = shouldLock ? new Date(Date.now() + lockoutMinutes * 60 * 1000) : null;
+
+      await pool.query(
+        `UPDATE users SET failed_login_attempts = $1, locked_until = $2 WHERE id = $3`,
+        [attempts, lockedUntil, user.id]
+      );
+
+      if (shouldLock) {
+        logger.warn('Account locked after failed attempts', { email: user.email, attempts });
+        return res.status(423).json({ error: `Account locked due to too many failed attempts. Try again in ${lockoutMinutes} minutes.` });
+      }
+
       return res.status(401).json({ error: 'Invalid credentials' });
     }
+
+    // Successful login — reset lockout counters
+    await pool.query(
+      `UPDATE users SET failed_login_attempts = 0, locked_until = NULL WHERE id = $1`,
+      [user.id]
+    );
 
     // Fetch user roles for the response
     const rolesResult = await pool.query(
@@ -269,7 +321,7 @@ router.post('/change-password', requireAuth, async (req, res) => {
 
 // Forgot password — generate token and send reset email
 // Always returns 200 to avoid revealing whether the email exists
-router.post('/forgot-password', authLimiter, async (req, res) => {
+router.post('/forgot-password', resetLimiter, async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: 'Email is required' });
 

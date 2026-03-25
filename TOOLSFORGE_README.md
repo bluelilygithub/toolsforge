@@ -2,7 +2,7 @@
 
 **Built by:** Michael Barrett
 **Purpose:** Multi-user modular platform — a foundation for building shared AI tools across an organisation
-**Status:** Foundation complete — auth, roles, permission service, invitation workflow, email delivery, password reset, profile management, password history, structured logging, in-app log viewer, email template management, font/theme customisation, AI model catalogue, role-based model permissions, SSE streaming backbone, AI Chat tool, admin UI
+**Status:** Foundation complete — auth, roles, permission service, invitation workflow, email delivery, password reset, profile management, password history, account lockout, configurable security settings, structured logging, in-app log viewer, email template management, font/theme customisation, AI model catalogue, role-based model permissions, SSE streaming backbone, AI Chat tool, Model Advisor, admin UI
 **Stack:** Node.js/Express · PostgreSQL · Docker · Railway · React/Vite · Tailwind CSS · Anthropic Claude
 
 ---
@@ -23,10 +23,25 @@
 - Profile update — first name, last name, phone stored on `users` table; updated via `PUT /api/auth/profile`
 
 #### Security
-- CORS locked to origin whitelist (`APP_URL` env var + localhost dev ports)
-- Rate limiting on `/api/auth/login` and `/api/auth/register` — 20 requests per 15 minutes
-- `requireAuth` middleware extracts and validates token, attaches `req.user` with `id`, `email`, `org_id`
-- `requireRole(['role_name'])` middleware delegates to `PermissionService` — no inline SQL in routes
+
+**HTTP hardening**
+- `helmet()` applied as the first middleware — sets Content-Security-Policy, HSTS, X-Frame-Options, X-Content-Type-Options, removes `X-Powered-By`. Without this, Express advertises itself in every response, enabling precise fingerprint-based attacks.
+- CORS locked to origin whitelist (`APP_URL` env var + localhost dev ports), scoped to `/api` only — static assets are never touched by CORS middleware
+
+**Brute-force protection — two complementary layers**
+
+The attack surface for a login endpoint has two distinct threat profiles, and a single control handles neither well:
+
+- **IP rate limiting** — stops one IP from hammering any account. Default: 5 attempts per 15 minutes per IP. Controlled by `security_login_rate_limit` in `system_settings`. Uses a function-based `max` in `express-rate-limit`, so admin changes take effect immediately without a server restart.
+- **Account lockout** — stops a distributed attacker rotating IPs who slowly probes a specific account. After N consecutive failures (default: 5), the account locks for M minutes (default: 15), regardless of which IP the attempts came from. Counter resets to zero on any successful login. Both thresholds are controlled by `security_login_max_attempts` and `security_lockout_minutes` in `system_settings`, read from the DB on every login attempt — changes are live immediately.
+
+Password reset (forgot-password) is separately rate-limited at 5 req/15 min to prevent email enumeration at scale.
+
+**Why configurable?** Appropriate thresholds depend on the organisation's risk profile and user behaviour. An org with a small, technical team on a trusted network can afford more generous limits. A public-facing deployment with non-technical users needs tighter controls. Hardcoded values mean either over-restricting legitimate users or under-protecting accounts. Admin-configurable thresholds let the operator tune to their context without a code deploy.
+
+**Auth middleware**
+- `requireAuth` extracts and validates the session token, attaches `req.user` with `id`, `email`, `org_id`
+- `requireRole(['role_name'])` delegates to `PermissionService` — no inline SQL in routes
 
 #### PermissionService (`server/services/permissions.js`)
 Single source of truth for all authorisation checks. Every route and future tool calls this — nothing writes its own permission SQL.
@@ -155,6 +170,33 @@ Permission check fires before the stream opens — returns 403 if the user's rol
 
 Returns the list of models the authenticated user may use for a given tool. Resolved by `PermissionService.getPermittedModels`.
 
+**`POST /api/tools/:toolSlug/analyse-prompt`**
+
+Pre-send classifier for the Model Advisor. Accepts `{ prompt, currentModelId }` and returns whether the current model is a good fit for the prompt.
+
+Request body:
+```json
+{ "prompt": "Explain the pros and cons of microservices...", "currentModelId": "claude-haiku-4-5-20251001" }
+```
+
+Response (mismatch detected):
+```json
+{
+  "mismatch": true,
+  "complexity": "complex",
+  "reason": "This prompt requires deep architectural analysis — a more capable model would give a better result.",
+  "suggestedTier": "advanced",
+  "suggestedModels": [{ "id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6", "emoji": "⚖️" }]
+}
+```
+
+Response (no mismatch):
+```json
+{ "mismatch": false }
+```
+
+**Critical:** `suggestedModels` is built exclusively from `PermissionService.getPermittedModels(userId, toolSlug)` filtered to the suggested tier. A user without `chat_premium` access can never receive Opus as a suggestion, regardless of prompt complexity. If the classifier call itself fails for any reason the endpoint returns `{ mismatch: false }` — the user is never blocked from sending.
+
 #### Tool Model Access Policy
 Each tool defines its model access policy in `tools.config.roleModelAccess` — a map of role name to tier. `PermissionService.getPermittedModels` reads this at request time; org_admin always receives all models regardless.
 
@@ -206,11 +248,14 @@ Each tool's `config.roles` array defines the roles an admin can grant to users f
 | `/api/tools` | GET | Yes | List installed tools |
 | `/api/tools/datetime` | GET | tool role or org_admin | Datetime tool — basic or extended response by role |
 | `/api/tools/:toolSlug/permitted-models` | GET | Yes | Models the user may use for this tool |
+| `/api/tools/:toolSlug/analyse-prompt` | POST | Yes | Classify prompt complexity, return model suggestion bounded to user's permitted tier |
 | `/api/tools/:toolSlug/stream` | POST | Yes | SSE stream — Anthropic response chunked as events |
 | `/api/admin/users` | GET | org_admin | All users with roles and activation status |
 | `/api/admin/invite` | POST | org_admin | Create invitation, sends email, returns activation URL |
 | `/api/admin/users/:id/resend-invite` | POST | org_admin | Regenerate activation link, sends email |
 | `/api/admin/users/:id/roles` | GET | org_admin | All roles for a user (global + tool-scoped) |
+| `/api/admin/users/:id/tool-access` | GET | org_admin | Structured tool access view — each tool with options and user's current selection |
+| `/api/admin/users/:id/tool-access` | PUT | org_admin | Update tool access — accepts `{ access: { toolSlug: roleName\|null } }`, applies diffs |
 | `/api/admin/users/:id/grant-role` | POST | org_admin | Grant a role at any scope |
 | `/api/admin/users/:id/revoke-role` | POST | org_admin | Revoke a role at any scope |
 | `/api/admin/tool-roles` | GET | org_admin | All assignable tool roles across enabled tools |
@@ -219,11 +264,17 @@ Each tool's `config.roles` array defines the roles an admin can grant to users f
 | `/api/admin/ai-models/reset` | POST | org_admin | Restore default model catalogue |
 | `/api/admin/model-status` | GET | org_admin | Whether ANTHROPIC_API_KEY is configured |
 | `/api/admin/test-model` | POST | org_admin | Send a live probe to an Anthropic model |
+| `/api/admin/security-settings` | GET | org_admin | Current security thresholds (rate limit, lockout attempts, lockout duration) |
+| `/api/admin/security-settings` | PUT | org_admin | Update thresholds — clamped server-side; rate limit applied in-process immediately |
 | `/api/admin/logs` | GET | org_admin | Paginated app logs — filter by level and message |
 | `/api/admin/email-templates` | GET | org_admin | List all email templates |
 | `/api/admin/email-templates/:slug` | GET | org_admin | Get single template with full HTML and plain text body |
 | `/api/admin/email-templates/:slug` | PUT | org_admin | Update template subject, body_html, body_text |
 | `/api/admin/email-templates/:slug/reset` | POST | org_admin | Reset template to hardcoded default content |
+| `/api/user-settings` | GET | Yes | All key/value settings for the authenticated user |
+| `/api/user-settings` | POST | Yes | Upsert a single setting `{ key, value }` for the authenticated user |
+| `/api/admin/app-settings` | GET | org_admin | Organisation-wide app settings (allowed file types, default timezone) |
+| `/api/admin/app-settings` | PUT | org_admin | Update organisation-wide app settings |
 | `/api/invitations/:token` | GET | No | Validate invitation token |
 | `/api/invitations/accept` | POST | No | Accept invitation, set password, return session |
 
@@ -236,7 +287,7 @@ Each tool's `config.roles` array defines the roles an admin can grant to users f
 | Table | Description |
 |---|---|
 | `organizations` | Single org; all users and data scoped to it |
-| `users` | Email + bcrypt password hash (nullable until activated) + `is_active` flag + `first_name`, `last_name`, `phone` |
+| `users` | Email + bcrypt password hash (nullable until activated) + `is_active` flag + `first_name`, `last_name`, `phone` + `failed_login_attempts`, `locked_until` |
 | `auth_sessions` | Token-based sessions with expiry |
 | `password_reset_tokens` | One-time 1-hour tokens for password reset flow |
 | `password_history` | Last N password hashes per user — reuse blocked on change and reset |
@@ -244,7 +295,7 @@ Each tool's `config.roles` array defines the roles an admin can grant to users f
 | `user_roles` | Many-to-many role assignments with contextual scoping (`global` / `tool` / `resource`) |
 | `invitation_tokens` | One-time 48h activation tokens for invited users |
 | `user_settings` | JSONB key/value settings per user |
-| `system_settings` | Admin-managed global config — spend thresholds, AI model catalogue |
+| `system_settings` | Admin-managed global config — security thresholds, spend thresholds, AI model catalogue |
 | `tools` | Tool registry — slug, name, version, enabled flag, JSONB config (roleModelAccess, roles) |
 | `usage_logs` | One row per AI response — model, tokens, cost, user, tool |
 | `app_logs` | Server log entries (info, warn, error) written by Winston DB transport |
@@ -287,8 +338,10 @@ Ported from Curam Vault — same patterns, rebranded for ToolsForge:
 | Settings | `/settings` | Authenticated |
 | Admin — Users | `/admin/users` | org_admin only |
 | Admin — AI Models | `/admin/ai-models` | org_admin only |
+| Admin — Security | `/admin/security` | org_admin only |
 | Admin — Email Templates | `/admin/email-templates` | org_admin only |
 | Admin — Logs | `/admin/logs` | org_admin only |
+| Admin — App Settings | `/admin/app-settings` | org_admin only |
 | Date & Time tool | `/tools/datetime` | datetime role or org_admin |
 | AI Chat tool | `/tools/chat` | org_member or org_admin |
 
@@ -306,9 +359,18 @@ Ported from Curam Vault — same patterns, rebranded for ToolsForge:
 
 **Settings — Appearance tab** — Live theme picker (5 swatches). Font picker with two tabs: Body Font and Heading Font. Fonts grouped by category (sans-serif, serif, monospace) with sample text previews. Selections apply immediately via CSS custom properties.
 
-**Admin — Users** — Table of all org users showing email, active/pending status badge, global roles as pills, join date. Invite User button opens modal. Invite modal: email + role selector → on success shows "Email sent" confirmation with collapsible fallback link. Resend Invite button on pending users regenerates the link and resends the email. Manage Roles button opens role modal — shows Organisation Role section (promote/demote org_admin, self-demotion blocked) and Tool Access section. The **Grant Access** dropdown is populated dynamically from `GET /api/admin/tool-roles`, grouped by tool — adding a new tool to the platform automatically adds its roles to this dropdown with no code changes.
+**Admin — Users** — Table of all org users showing email, active/pending status badge, global roles as pills, join date. Invite User button opens modal. Invite modal: email + role selector → on success shows "Email sent" confirmation with collapsible fallback link. Resend Invite button on pending users regenerates the link and resends the email. **Manage Access** button opens the access modal — shows Organisation section (promote/demote org_admin, self-demotion blocked) and Tool Access section. Tool Access renders one radio group per installed tool: each tool shows its access options in plain language (e.g. "Standard (all members) / Advanced / Premium") with the user's current selection highlighted. Single **Save Changes** button applies only the changed tools as role diffs. Role names (`chat_advanced`, etc.) are never exposed to the admin — the modal is a projection layer over the underlying RBAC model. New tools appear automatically with no admin UI code changes.
 
 **Admin — AI Models** — Manage the AI model catalogue. Displays all configured models with tier badge, API ID, and pricing. Add, edit, or delete any model. Edit form includes model API ID, display name, tier (standard / advanced / premium), provider, emoji, label, tagline, description, input price per 1M tokens, output price per 1M tokens, and context window. **Test** button sends a live probe to the Anthropic API and shows the result inline. **Reset defaults** button restores the three built-in models. API key status banner shows whether `ANTHROPIC_API_KEY` is configured. Changes take effect immediately across the entire platform — no redeploy needed.
+
+**Admin — Security** — Configure authentication security thresholds without a code deploy. Three settings:
+- **Max failed login attempts** — how many consecutive wrong passwords lock an account (default: 5, range: 1–20)
+- **Account lockout duration** — how long a locked account stays locked (default: 15 minutes, range: 1–1440)
+- **Login rate limit** — maximum login attempts per IP address per 15-minute window (default: 5, range: 1–20)
+
+Each field highlights when its value differs from the last saved state. Save Changes applies all at once. Reset to defaults restores the original values in the form without saving — requires an explicit save to commit. An explanatory panel below the fields describes how rate limiting and account lockout complement each other, so the admin understands the trade-off before adjusting.
+
+Rate limit changes take effect immediately (in-process, no restart). Lockout threshold changes take effect on the next login attempt.
 
 **Admin — Email Templates** — Lists all platform and tool email templates grouped by section. Each row shows the subject, description, and available `{{variables}}`. Clicking Edit opens a modal with three tabs: **HTML Source** (edit raw HTML — what email clients display), **Preview** (rendered iframe view of the HTML with placeholders shown as-is), and **Plain Text** (fallback for non-HTML clients, with an Auto-generate from HTML button). Variable chips are clickable — click any chip to insert the placeholder at the cursor position in whichever field is active. Changes are saved to the DB and survive server restarts; defaults are never overwritten on deploy. A Reset to Default button restores the original hardcoded content.
 
@@ -316,11 +378,48 @@ Ported from Curam Vault — same patterns, rebranded for ToolsForge:
 
 **Date & Time** — Proof-of-concept tool demonstrating three access tiers: no role → access denied screen; `datetime_viewer` → date and time; `datetime_extended` (or org_admin) → date, time, timezone, UTC offset, server location. Refresh button re-fetches live server time.
 
-**AI Chat** — Full chat interface using the SSE streaming backbone. Model picker shows only the models the signed-in user is permitted to use for this tool (resolved from their roles). Streaming assistant responses rendered in real time. Token + cost badge shown after each response. Auto-resizing textarea, Shift+Enter for new lines, Stop button to abort mid-stream, New Chat to reset. All org members get Haiku by default; admins grant `chat_advanced` (Sonnet) or `chat_premium` (Opus) per user.
+**Admin — App Settings** — Organisation-wide defaults for chat behaviour. Two settings: **Allowed File Types** (comma-separated MIME/extension list accepted in chat uploads, e.g. `.pdf,.txt,image/*`) and **Default Timezone** (used as the org-level fallback for AI date context; individual users can override in their profile). Dirty-state border highlight on any changed field. `GET/PUT /api/admin/app-settings`.
+
+**AI Chat** — Full chat interface using the SSE streaming backbone. Model picker shows only the models the signed-in user is permitted to use for this tool (resolved from their roles). Streaming assistant responses rendered in real time. Token + cost badge shown after each response. Auto-resizing textarea, Shift+Enter for new lines, Stop button to abort mid-stream, New Chat to reset. All org members get Haiku by default; admins grant `chat_advanced` (Sonnet) or `chat_premium` (Opus) per user. Full media and voice capability: mic button for voice dictation, speaker button to read aloud responses, paperclip button to attach files, image paste from clipboard, date stamp below each AI response.
+
+Every send passes through the **Model Advisor** before the stream opens — see below.
+
+#### Model Advisor
+
+A pre-send classifier that intercepts every chat submission and suggests a better-matched model if the current selection is a poor fit for the task. Ported and adapted from Curam Vault.
+
+**Flow:**
+1. User presses Enter or the send button → `checkModelBeforeSend()` fires
+2. Client POSTs `{ prompt, currentModelId }` to `POST /api/tools/chat/analyse-prompt`
+3. Server uses the cheapest permitted model to classify prompt complexity: `simple → standard`, `moderate → advanced`, `complex → premium`
+4. If the current model already matches that tier: `mismatch: false` → send proceeds immediately with no interruption
+5. If there is a mismatch: `ModelAdvisorModal` opens with the reason and a list of suggested alternatives
+6. User chooses **Switch & Send** (changes model, fires send), **Keep & Send** (ignores suggestion, sends anyway), or dismisses (cancels)
+
+**Why this matters for an organisation:**
+
+In a single-user application the user owns both the cost and the decision — they can freely pick whatever model they like. In a multi-user organisational platform, the calculus is different:
+
+- **Cost is shared.** Overspending on a premium model for a simple question wastes budget that affects everyone in the org.
+- **Admins grant model tiers, not individual prompts.** A user granted Sonnet access should be guided toward using Haiku when Haiku is sufficient — the advisor does this automatically, without admin involvement on every interaction.
+- **Access limits are hard; quality guidance is soft.** The advisor is advisory, not blocking — the user always retains control. But it surfaces the right choice at the right moment.
+- **The suggestion is permission-bounded.** The advisor will never suggest a model the user cannot access. If a prompt genuinely needs Opus but the user only has Sonnet access, the advisor surfaces Sonnet (the best within their tier) — it does not expose what they're missing or offer an upgrade path. Access decisions remain with the admin.
+
+This combination — hard server-side enforcement on the stream endpoint, soft client-side guidance before the send — means cost efficiency is the default behaviour without requiring users to understand tier economics.
+
+**Failure safety:** If the classifier call fails (network error, API issue, malformed response), the endpoint returns `{ mismatch: false }` and the send proceeds normally. The user is never blocked.
 
 #### Hooks
 
 **`useStream(toolSlug)`** (`client/src/hooks/useStream.js`) — generic SSE streaming hook for AI tools. Uses `fetch` + `ReadableStream` (not `EventSource`, which does not support POST). Exposes `send(messages, modelId, options)`, `stop()`, `reset()`, `streaming`, `content`, `usage`, `error`. Any tool page uses this hook — no tool writes its own SSE reader.
+
+**`useSpeechInput()`** (`client/src/hooks/useSpeechInput.js`) — headless voice dictation via Web Speech API. `continuous: true`, accumulates finals + interim across natural pauses. Returns `{ listening, transcript, start, stop, clear, supported }`. Hides itself gracefully in unsupported browsers.
+
+**`useReadAloud()`** (`client/src/hooks/useReadAloud.js`) — headless text-to-speech via `speechSynthesis`. Calls `stripForSpeech()` before speaking to remove markdown, code blocks, and URLs. Returns `{ speaking, paused, speak, pause, resume, stop, supported }`.
+
+**`useClipboardMedia()`** (`client/src/hooks/useClipboardMedia.js`) — handles image paste from clipboard. Resizes pasted images to 800 px on the longest edge (JPEG 0.75 quality) client-side. Returns `{ images, addFromPaste(e), removeImage(id), clear }`. `addFromPaste` returns `true` if an image was captured (caller should suppress default paste behaviour).
+
+**`useFileAttachment()`** (`client/src/hooks/useFileAttachment.js`) — file picker with admin-configurable allowed types. Fetches `chat_allowed_file_types` from `/api/admin/app-settings` on mount. Images go through the same canvas resize pipeline as clipboard paste. Text files (`.txt`, `.md`, `.csv`, `.json`, code files) are read client-side via FileReader — 500 KB limit. Returns `{ files, images, openPicker, removeFile, removeImage, clear, allowedTypes }`.
 
 #### Component Structure
 ```
@@ -337,26 +436,36 @@ client/src/
     settingsStore.js           # theme, bodyFont, headingFont — persisted
   hooks/
     useStream.js               # Generic SSE streaming hook for AI tools
+    useSpeechInput.js          # Headless voice dictation (Web Speech API)
+    useReadAloud.js            # Headless text-to-speech (speechSynthesis)
+    useClipboardMedia.js       # Clipboard image paste with canvas resize
+    useFileAttachment.js       # File picker — images + text, admin-configured types
   utils/
     apiClient.js               # Fetch wrapper — auto-attaches Bearer token
+    stripForSpeech.js          # Strips markdown/code/URLs before TTS — importable by any tool
   components/
     AuthGuard.jsx              # Validates token on mount, redirects to /login
     Layout.jsx                 # Top bar + collapsible sidebar + Outlet
     Sidebar.jsx                # Nav: Home, Tools section, Admin section (org_admin), Settings
     Toast.jsx                  # Toast context + floating notifications
+    ModelAdvisorModal.jsx      # Pre-send model suggestion modal — Switch & Send / Keep & Send
+    VoiceInputButton.jsx       # Stateless UI primitive — mic idle / red pulsing dot + Stop when active
+    ReadAloudButton.jsx        # Stateless UI primitive — speaker idle / pause + stop when speaking
   pages/
     LoginPage.jsx
     ForgotPasswordPage.jsx
     ResetPasswordPage.jsx
     AcceptInvitePage.jsx
     DashboardPage.jsx
-    SettingsPage.jsx
+    SettingsPage.jsx           # Profile tab includes user timezone override
     AdminUsersPage.jsx
     AdminAIModelsPage.jsx
+    AdminSecurityPage.jsx
     AdminEmailTemplatesPage.jsx
     AdminLogsPage.jsx
+    AdminAppSettingsPage.jsx   # Allowed file types + default timezone
     DateTimePage.jsx
-    ChatPage.jsx
+    ChatPage.jsx               # Voice input, read aloud, file attachments, image paste, date stamps
 ```
 
 ---
@@ -386,15 +495,277 @@ server/
     auth.js                    # register, login, logout, me, profile, change-password, forgot/reset-password
     tools.js                   # GET /api/tools
     datetime.js                # GET /api/tools/datetime — basic or extended by role
-    stream.js                  # SSE streaming + permitted-models for all AI tools
+    stream.js                  # SSE streaming + permitted-models + analyse-prompt for all AI tools
     org.js                     # GET /api/org
-    admin.js                   # users, invite, roles, tool-roles, ai-models, test-model, logs, email-templates
+    admin.js                   # users, invite, roles, tool-roles, ai-models, test-model, security-settings, logs, email-templates, app-settings
+    userSettings.js            # GET/POST /api/user-settings — per-user key/value JSONB store
     invitations.js             # GET /api/invitations/:token, POST /api/invitations/accept
 ```
 
 ---
 
-## Adding a New Tool
+## Reusable Tool Primitives
+
+These are ready-to-drop-in building blocks. Each follows the **three-layer pattern**:
+
+1. **Headless hook** — pure logic, no JSX. Manages state and browser APIs. Lives in `client/src/hooks/`.
+2. **UI primitive** — a stateless, styled component with no knowledge of the tool it's in. Lives in `client/src/components/`.
+3. **Integration point** — the tool page composes the hook and UI primitive together. Business logic (what to do with the result) stays in the page.
+
+This separation means a hook can power any tool (or multiple tools simultaneously), and a UI primitive can be reskinned without touching any hook logic.
+
+---
+
+### Voice Input
+
+Lets users dictate into any text field using the Web Speech API.
+
+**Hook:** `useSpeechInput()` — `client/src/hooks/useSpeechInput.js`
+```js
+const { listening, transcript, start, stop, clear, supported } = useSpeechInput();
+```
+- `listening` — `true` while recording
+- `transcript` — accumulated text (finals + live interim)
+- `start()` / `stop()` — begin / end session
+- `clear()` — reset transcript to empty string
+- `supported` — `false` in browsers without `SpeechRecognition` (hide the button)
+
+**UI primitive:** `VoiceInputButton` — `client/src/components/VoiceInputButton.jsx`
+```jsx
+<VoiceInputButton
+  listening={listening}
+  onStart={start}
+  onStop={stop}
+  disabled={streaming}
+/>
+```
+Idle state: mic icon. Active state: red pulsing dot + "Stop" pill.
+
+**Integrating into a new tool page:**
+```jsx
+import { useSpeechInput } from '../hooks/useSpeechInput';
+import VoiceInputButton from '../components/VoiceInputButton';
+
+const { listening, transcript, start, stop, clear, supported } = useSpeechInput();
+
+// Sync transcript to your input field
+useEffect(() => { if (transcript) setInput(transcript); }, [transcript]);
+
+// Stop mic when sending
+function handleSend() {
+  if (listening) { stop(); clear(); }
+  // ... rest of send logic
+}
+
+// In JSX — place next to your textarea send button
+{supported && (
+  <VoiceInputButton listening={listening} onStart={start} onStop={stop} disabled={streaming} />
+)}
+```
+
+---
+
+### Read Aloud
+
+Reads any text string aloud via the browser's speech synthesis engine. Strips markdown, code blocks, and URLs before speaking so the output sounds natural.
+
+**Utility:** `stripForSpeech(text)` — `client/src/utils/stripForSpeech.js`
+
+Standalone function. Removes fenced code blocks, inline code, URLs, HTML tags, markdown syntax. Any tool can import and use this directly (e.g. to pre-process text before display or export as well as speech).
+
+**Hook:** `useReadAloud()` — `client/src/hooks/useReadAloud.js`
+```js
+const { speaking, paused, speak, pause, resume, stop, supported } = useReadAloud();
+```
+- `speak(text)` — calls `stripForSpeech` internally; starts utterance
+- `pause()` / `resume()` / `stop()` — playback controls
+- `supported` — `false` in browsers without `speechSynthesis`
+
+**UI primitive:** `ReadAloudButton` — `client/src/components/ReadAloudButton.jsx`
+```jsx
+<ReadAloudButton
+  speaking={speaking}
+  paused={paused}
+  onSpeak={() => speak(messageText)}
+  onPause={pause}
+  onResume={resume}
+  onStop={stop}
+/>
+```
+Idle: speaker icon. Playing: pause + stop buttons. Paused: play + stop buttons.
+
+**Integrating into a new tool page:**
+```jsx
+import { useReadAloud } from '../hooks/useReadAloud';
+import ReadAloudButton from '../components/ReadAloudButton';
+
+const { speaking, paused, speak, pause, resume, stop: stopReading, supported: ttsSupported } = useReadAloud();
+
+// Stop reading when a new send begins
+function handleSend() {
+  if (speaking) stopReading();
+  // ... rest of send logic
+}
+
+// In JSX — place below any text response
+{ttsSupported && (
+  <ReadAloudButton
+    speaking={speaking}
+    paused={paused}
+    onSpeak={() => speak(responseText)}
+    onPause={pause}
+    onResume={resume}
+    onStop={stopReading}
+  />
+)}
+```
+
+---
+
+### Clipboard Image Paste
+
+Captures images pasted from the clipboard (screenshot, image copy) and resizes them client-side before sending to the AI. No server round-trip required.
+
+**Hook:** `useClipboardMedia()` — `client/src/hooks/useClipboardMedia.js`
+```js
+const { images, addFromPaste, removeImage, clear } = useClipboardMedia();
+```
+- `images` — array of `{ id, mimeType, data (base64), preview (data-URL) }`
+- `addFromPaste(e)` — call from a `onPaste` handler; returns `true` if an image was captured (call `e.preventDefault()` is handled inside). Returns `false` for non-image paste — let the default behaviour proceed.
+- `removeImage(id)` — remove one image by id
+- `clear()` — remove all (call after send)
+
+Images are resized to a maximum 800 px on the longest edge, encoded as JPEG at 0.75 quality.
+
+**Integrating into a new tool page:**
+```jsx
+import { useClipboardMedia } from '../hooks/useClipboardMedia';
+
+const { images: pastedImages, addFromPaste, removeImage: removePasted, clear: clearPasted } = useClipboardMedia();
+
+// On textarea
+<textarea onPaste={addFromPaste} ... />
+
+// Show thumbnails
+{pastedImages.map(img => (
+  <div key={img.id} style={{ position: 'relative', display: 'inline-block' }}>
+    <img src={img.preview} style={{ width: 60, height: 60, objectFit: 'cover', borderRadius: 8 }} />
+    <button onClick={() => removePasted(img.id)}>×</button>
+  </div>
+))}
+
+// After send
+clearPasted();
+```
+
+---
+
+### File Attachment
+
+Lets users attach files via a file picker. Images go through the same canvas resize pipeline as clipboard paste. Text/code files are injected inline into the message. Allowed file types are read from the admin App Settings (`/api/admin/app-settings`).
+
+**Hook:** `useFileAttachment()` — `client/src/hooks/useFileAttachment.js`
+```js
+const { files, images, openPicker, removeFile, removeImage, clear, allowedTypes } = useFileAttachment();
+```
+- `files` — array of `{ id, name, content (string) }` — text/code files, ready to prepend to message
+- `images` — array of `{ id, mimeType, data, preview }` — same shape as clipboard images
+- `openPicker()` — opens the native file picker with `allowedTypes` as the `accept` attribute
+- `removeFile(id)` / `removeImage(id)` — remove individual attachments
+- `clear()` — clear all attachments (call after send)
+- `allowedTypes` — string loaded from admin settings (e.g. `.pdf,.txt,image/*`)
+
+**Integrating into a new tool page:**
+```jsx
+import { useFileAttachment } from '../hooks/useFileAttachment';
+
+const { files, images: attachedImages, openPicker, removeFile, removeImage: removeAttached, clear: clearAttachments } = useFileAttachment();
+
+// Paperclip button
+<button onClick={openPicker}>📎</button>
+
+// Combine with clipboard images for the API call
+const allImages = [...pastedImages, ...attachedImages];
+
+// Prepend text file content to the message
+const textContent = files.map(f => `[File: ${f.name}]\n${f.content}`).join('\n\n');
+const fullMessage = textContent ? `${textContent}\n\n${userInput}` : userInput;
+
+// Build multipart Anthropic messages when images are present
+const content = allImages.length > 0
+  ? [
+      ...allImages.map(img => ({ type: 'image', source: { type: 'base64', media_type: img.mimeType, data: img.data } })),
+      { type: 'text', text: fullMessage },
+    ]
+  : fullMessage;
+
+// After send
+clearAttachments();
+```
+
+---
+
+### Timezone-Aware Date Context
+
+Injects the current date and time (in the correct timezone) into the AI system prompt on every call, so responses are always temporally grounded.
+
+**Timezone resolution chain (in order of precedence):**
+1. User setting — `GET /api/user-settings` → key `timezone`
+2. Org default — `GET /api/admin/app-settings` → `default_timezone`
+3. Browser fallback — `Intl.DateTimeFormat().resolvedOptions().timeZone`
+
+**In a tool page:**
+```js
+// Load on mount
+const [timezone, setTimezone] = useState('UTC');
+useEffect(() => {
+  Promise.all([
+    api.get('/api/user-settings').then(r => r.json()),
+    api.get('/api/admin/app-settings').then(r => r.json()),
+  ]).then(([userSettings, appSettings]) => {
+    setTimezone(
+      userSettings.timezone ||
+      appSettings.default_timezone ||
+      Intl.DateTimeFormat().resolvedOptions().timeZone
+    );
+  });
+}, []);
+
+// Build system prompt with date context
+function buildSystemPrompt(tz) {
+  const now = new Date().toLocaleString('en', {
+    timeZone: tz,
+    dateStyle: 'full',
+    timeStyle: 'short',
+  });
+  return `Current date and time: ${now} (${tz}).\n\nYou are a helpful assistant.`;
+}
+
+// Pass to stream
+await send(messages, modelId, { system: buildSystemPrompt(timezone) });
+```
+
+**Admin configuration:** `Admin → App Settings` → Default Timezone (select from full `Intl.supportedValuesOf('timeZone')` list).
+
+**User override:** `Settings → Profile → Timezone` — overrides the org default for that user only. Saved to `user_settings` table via `POST /api/user-settings` with `{ key: 'timezone', value: tz }`.
+
+---
+
+### Adding All Primitives to a New Tool — Checklist
+
+When building a new AI tool page that needs the full capability set:
+
+- [ ] Import `useSpeechInput` + `VoiceInputButton` — place mic button beside send
+- [ ] Import `useReadAloud` + `ReadAloudButton` — place speaker button below each AI response
+- [ ] Import `useClipboardMedia` — attach `onPaste={addFromPaste}` to textarea
+- [ ] Import `useFileAttachment` — add paperclip button; merge `files` + `images` into message
+- [ ] Load timezone via the three-tier resolution chain on mount
+- [ ] Pass `{ system: buildSystemPrompt(timezone) }` in every `send()` call
+- [ ] In `handleSend`: call `stop()` + `clear()` on speech input, call `stopReading()` on TTS, call `clearPasted()` + `clearAttachments()` after building the message
+
+None of these primitives require any server changes — they are entirely client-side except for the timezone fetch (which reuses existing endpoints) and the allowed file types fetch (which reuses the admin app-settings endpoint).
+
+---
 
 A new tool follows this pattern — no changes to existing admin UI code are needed:
 
@@ -645,12 +1016,49 @@ The native browser `EventSource` API only supports GET requests. AI tool streami
 
 The model catalogue is stored in `system_settings` under key `ai_models` as a JSON array. This lets admins add, edit, or remove models without a redeploy. The static `MODEL_CATALOGUE` in `modelCatalogue.js` is only used as the seed on first startup and as a fallback if the DB is unavailable. `costCalculator.js` reads live pricing from the DB, so a pricing update takes effect immediately.
 
-#### 8. Tool config as self-describing contract
+#### 8. User access management — projection layer over roles
+
+The admin **Manage Access** modal (`AdminUsersPage → AccessModal`) presents tool access as a set of radio groups (one per tool), not a list of internal role names. The admin sees "No access / Standard / Advanced / Premium" — not `chat_advanced` or `chat_premium`.
+
+The backend is unchanged: the modal calls `GET /api/admin/users/:id/tool-access` (which reads `config.roles` and the user's current assignments) and `PUT /api/admin/users/:id/tool-access` (which translates the selection back to role grants/revocations). Role names remain an implementation detail — they never surface in the admin UI.
+
+This matters for an organisational platform because admin users are not necessarily technical. A manager granting a colleague access to "AI Chat — Advanced (Sonnet)" is a meaningful business decision; assigning role `chat_advanced` with scope `tool/chat` is not a natural way for a non-developer to think about it. The projection layer keeps the underlying RBAC model intact while presenting it in terms the admin actually understands.
+
+#### 9. Tool config as self-describing contract
 
 Each tool stores both its model access policy (`roleModelAccess`) and its grantable roles (`roles`) in `tools.config` JSONB. This means:
 - `PermissionService.getPermittedModels` needs no knowledge of individual tools
 - The admin Grant Access dropdown (`GET /api/admin/tool-roles`) aggregates dynamically
+- The `Manage Access` modal (`GET /api/admin/users/:id/tool-access`) reads the same config to build its radio options
 - A new tool is fully described by its seed entry — no admin UI code changes required
+
+#### 10. Model Advisor — soft guidance within hard permission boundaries
+
+The Model Advisor operates in two distinct layers that must not be conflated:
+
+**Hard layer (stream endpoint):** `POST /api/tools/:toolSlug/stream` calls `PermissionService.canUseModel` before opening any SSE connection. A user without premium access cannot use Opus regardless of what the client sends. This cannot be bypassed.
+
+**Soft layer (advisor):** `POST /api/tools/:toolSlug/analyse-prompt` classifies the prompt and suggests a better model *from the user's permitted set only*. It is purely advisory — the user can always choose "Keep & Send". If the endpoint fails, the send proceeds normally.
+
+The separation is intentional. Enforcement belongs on the server, always. Guidance belongs on the client, where it can be contextual and graceful. Combining them (e.g. blocking a send because the model is "wrong") would be paternalistic and would create user-facing errors for what is fundamentally a cost-efficiency hint.
+
+The advisor also deliberately does not show what the user is *missing*. A user on the standard tier who sends a complex prompt will see Sonnet suggested (their ceiling), not Opus with an upgrade prompt. Access tiering is a business decision made by the admin — the product should not second-guess or circumvent it.
+
+#### 11. Security thresholds as admin-configurable settings
+
+Hardcoded security thresholds are a liability in an organisational platform. The right values depend on context:
+
+- A small internal team on a trusted network can tolerate a higher login rate limit without increasing meaningful risk — tightening it unnecessarily creates friction for legitimate users who mistype their password.
+- A deployment accessible from public networks with non-technical users warrants stricter lockout after fewer attempts.
+- An organisation that has experienced a credential-stuffing incident may want to set lockout to 2 attempts and 60 minutes immediately, without waiting for a code deploy.
+
+The three configurable thresholds — `security_login_max_attempts`, `security_lockout_minutes`, `security_login_rate_limit` — are stored in `system_settings` (the same table as the AI model catalogue and spend thresholds). This makes them:
+
+- **Auditable** — changes are written with `updated_by` and `updated_at`
+- **Persistent** — survive server restarts; seeded with sensible defaults on first deploy
+- **Immediately effective** — lockout thresholds are read from DB on every login attempt; the rate limiter uses a function-based `max` (`() => rateLimitConfig.loginMax`) so in-process config updates take effect on the next request without a restart
+
+Values are clamped server-side on `PUT /api/admin/security-settings` (attempts: 1–20, lockout: 1–1440 min, rate limit: 1–20) regardless of what the client sends — the admin UI cannot be used to disable these controls entirely.
 
 ### Railway Environment Variables
 
@@ -692,11 +1100,114 @@ Prevents host `node_modules` from polluting the Docker build context. Without th
 
 ---
 
+## Chat Module — Feature Backlog
+
+The current AI Chat tool is a functional foundation: streaming responses, permitted model picker, Model Advisor, usage tracking. What it lacks are the interaction features that make a chat interface genuinely useful day-to-day. These were all present in Curam Vault as a single-user application. The challenge for ToolsForge is not rebuilding them — it's extracting them into composable, reusable units that any future tool module can consume, not just chat.
+
+### The Three-Layer Modularity Pattern
+
+Before listing individual features, the pattern that governs how they should be built:
+
+**Layer 1 — Headless hook (pure logic, no UI)**
+A hook that knows nothing about where it lives. `useVoice` exposes `startListening()`, `stopListening()`, `transcript`, `speak(text)`. It doesn't know it's inside a chat interface. A future notes module, a task module, or a document editor could import the same hook for dictation. If a hook imports anything from `chat/`, it's coupled and no longer reusable.
+
+**Layer 2 — UI primitive (styled component, no module knowledge)**
+A component that wraps the hook and renders a control. `<VoiceButton />` calls `useVoice` internally and renders a mic icon. `<FileDropzone />` calls `useFileAttachment` and renders a drag target. These components have no knowledge of which module they're sitting in — they accept callbacks as props (`onTranscript`, `onFile`) and leave the wiring to the consumer.
+
+**Layer 3 — Integration point (the module composes both)**
+The chat page (or any other consumer) imports the hook and the primitive, wires the output into its own context. Chat takes the voice transcript and appends it to the message input. A notes module takes the same transcript and appends it to the note body. Same hook, same button, different wiring. The module owns the integration — not the feature.
+
+This pattern is the discipline that makes ToolsForge a toolkit rather than a monolith. Every feature below should be designed to this pattern before any code is written.
+
+---
+
+### Feature Backlog
+
+#### Voice I/O (mic / speaker)
+Curam Vault had a `useVoice` hook using the Web Speech API — browser-native, no backend required for basic speech-to-text. Text-to-speech output (reading responses aloud) used the same API in reverse.
+
+**Modular design:** `useVoice` lives in `client/src/hooks/` — shared, not chat-specific. Exposes `startListening()`, `stopListening()`, `transcript`, `isListening`, `speak(text)`, `isSpeaking`. A `<VoiceButton />` primitive in `client/src/components/` wraps it. Chat wires `transcript` into the message input on silence detection. Any other module that wants dictation imports the same hook.
+
+---
+
+#### File Uploads
+The original had a `useFileAttachment` hook and a full server-side pipeline: upload → extract text → summarise via AI → chunk → embed → store. Session files (attached per-conversation) and pinned files (persistent across sessions) were distinct. Session files persisted to a `session_files` table so context survived a page refresh.
+
+**Modular design:** The server processing pipeline (`POST /api/files/upload`) is a generic endpoint — any module calls it to get extracted, summarised content back. The `useFileAttachment` hook wraps upload progress and result state. A `<FileAttachButton />` primitive renders the trigger. Chat uses it for conversational context injection; a future document module could use the same endpoint for knowledge base ingestion. The `session_files` table concept becomes `tool_files` with a `tool_slug` column, scoped per module.
+
+---
+
+#### Image Paste / Attach
+Copy-pasting an image directly into the chat input — clipboard images captured as blobs and sent as base64 inline content in the message payload. This is distinct from file upload — it's about visual content inline in the conversation, handled entirely client-side before sending.
+
+**Modular design:** A `useClipboardMedia` hook that listens for `paste` events and extracts image blobs. A `<PasteImagePreview />` primitive that renders thumbnails and a remove button. Chat wires the resulting image data into the message payload as `inlineImages`. Any rich text or input interface benefits from the same hook.
+
+---
+
+#### Show More / Show Less
+A UI toggle on long AI responses — truncate rendered content beyond a threshold height, show a "Show more" link to expand. Pure frontend, no backend involvement.
+
+**Modular design:** A generic `<CollapsibleContent />` component that accepts `content`, `maxHeight`, and `renderFn` as props. Chat wraps message bubbles with it. A search results module could use it around long snippets. A document viewer could use it around long sections. The component owns the collapse logic; the consumer owns the threshold and the render function.
+
+---
+
+#### Current Date Injection
+Without a date in the system prompt, the model has no reliable knowledge of "today" and will either guess, hallucinate, or refuse to answer date-relative questions. Curam Vault injected the current date and user timezone into every system prompt.
+
+**Modular design:** A utility function `getSystemDateContext()` in `client/src/utils/` that returns a string like `"Today is Wednesday, 26 March 2026. User timezone: Australia/Brisbane (AEST, UTC+10)."` Any module that assembles a system prompt calls it. This is a one-line addition but has meaningful impact on response quality for any time-sensitive task. The server-side equivalent already logs timezone in the stream endpoint — the client-side utility closes the loop.
+
+---
+
+#### Convert to Markdown
+Export a conversation (or any structured content) as a downloadable `.md` file. Takes the message history, formats it as Markdown with role prefixes, and triggers a browser download. Pure client-side logic on data already in memory.
+
+**Modular design:** A utility function `exportToMarkdown(messages, filename)` in `client/src/utils/` that formats and triggers the download. A `<ExportButton />` primitive that calls it. Chat uses it for conversation export; a notes module could use the same utility for note export; a search module could export search results. The function should accept a generic `{ role, content }[]` array — not a chat-specific type.
+
+---
+
+#### Follow-Up Questions
+After each AI response, generate 2–3 contextual follow-up questions the user might want to ask next. In Curam Vault this was implemented as contextual prompt chips rendered below the response. The generation was either appended to the main stream request as a structured output instruction, or fired as a separate lightweight follow-up call.
+
+**Modular design:** A utility `appendFollowUpRequest(systemPrompt)` that appends a structured instruction asking the model to return follow-up suggestions as a JSON array at the end of its response. The `useStream` hook (or the stream endpoint) parses and strips the structured section before rendering the response body, emitting a `followUps` event alongside the normal `text` events. A `<FollowUpChips />` primitive renders the suggestions as clickable pills. Chat wires chip clicks into the message input. Any AI-powered module that wants to guide the user's next action can use the same pattern.
+
+---
+
+#### URL Attachment
+Fetch a URL's content and inject it into the conversation as context. Curam Vault had SSRF-guarded server-side fetching, YouTube transcript extraction via InnerTube, and Haiku-powered summarisation of long page content before injection.
+
+**Modular design:** A server endpoint `POST /api/tools/:toolSlug/fetch-url` handles the fetch and summarisation — tool-scoped so usage is logged against the right tool. The SSRF guard (block private IP ranges, localhost, cloud metadata endpoints) lives in a shared middleware. A `useUrlAttachment` hook manages the loading and result state client-side. A `<UrlBar />` primitive renders the input and status. Chat wires the returned summary into the message context. A research tool module could use the same endpoint to build a reading list.
+
+---
+
+### Implementation Priority
+
+| Feature | Complexity | Backend needed | Reuse potential |
+|---|---|---|---|
+| Current date injection | Trivial | No | High — every AI tool benefits |
+| Show more / Show less | Low | No | High — any long-content module |
+| Convert to Markdown | Low | No | High — any content module |
+| Voice I/O | Medium | No | High — any input interface |
+| Image paste | Medium | No | Medium — input-heavy modules |
+| Follow-up questions | Medium | Minimal | High — any AI tool |
+| File uploads | High | Yes | High — many future tools |
+| URL attachment | High | Yes (SSRF guard) | Medium — research/context tools |
+
+Current date injection is the highest-value, lowest-effort item — one utility function, one line in the system prompt assembly, immediate improvement in response quality for any date-sensitive query.
+
+---
+
 ## What's Next
 
+- [ ] Chat — current date injection (`getSystemDateContext()` utility, one line in system prompt)
+- [ ] Chat — show more / show less (`<CollapsibleContent />` component around long responses)
+- [ ] Chat — convert to Markdown (export utility + button)
+- [ ] Chat — voice I/O (`useVoice` hook + `<VoiceButton />` primitive)
+- [ ] Chat — image paste (`useClipboardMedia` hook + inline preview)
+- [ ] Chat — follow-up question chips (`appendFollowUpRequest` utility + `<FollowUpChips />`)
+- [ ] Chat — file uploads (server pipeline + `useFileAttachment` hook)
+- [ ] Chat — URL attachment (server fetch + SSRF guard + `useUrlAttachment` hook)
 - [ ] Usage dashboard — admin view of token spend by user, tool, and model with date range filters (`usage_logs` table is ready)
 - [ ] Per-user spend caps — `user_settings` key for a personal daily/monthly limit checked in `usageLogger.checkSpendThresholds`
-- [ ] Account lockout — per-user failed login counter; lock after N attempts (rate limiting covers IP-based abuse; this closes slow credential-stuffing against known emails)
 - [ ] Active sessions panel — show user where they're logged in, "sign out everywhere" button (`auth_sessions` table is ready)
 - [ ] Audit log — dedicated table for key events (login, role changes, invitations) separate from the application error log
 - [ ] Tool schema isolation — each tool gets its own DB schema

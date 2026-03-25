@@ -53,6 +53,75 @@ router.get('/:toolSlug/permitted-models', requireAuth, async (req, res) => {
   }
 });
 
+/**
+ * POST /api/tools/:toolSlug/analyse-prompt
+ * Classifies prompt complexity and suggests a better model if the current one is a mismatch.
+ * suggestedModels is always filtered to the user's permitted models — never escalates beyond access.
+ */
+router.post('/:toolSlug/analyse-prompt', requireAuth, async (req, res) => {
+  const { toolSlug } = req.params;
+  const { prompt, currentModelId } = req.body;
+
+  if (!prompt) return res.json({ mismatch: false });
+  if (!process.env.ANTHROPIC_API_KEY) return res.json({ mismatch: false });
+
+  try {
+    const permittedModels = await PermissionService.getPermittedModels(req.user.id, toolSlug);
+    if (!permittedModels.length) return res.json({ mismatch: false });
+
+    // Use the lightest permitted model for classification (cheapest possible call)
+    const classifierModel = (
+      permittedModels.find(m => m.tier === 'standard') ||
+      permittedModels.find(m => m.tier === 'advanced') ||
+      permittedModels[0]
+    ).id;
+
+    const msg = await anthropic.messages.create({
+      model: classifierModel,
+      max_tokens: 128,
+      system: `You are a prompt complexity classifier. Return ONLY valid JSON with no preamble or markdown.
+
+{
+  "complexity": "simple" | "moderate" | "complex",
+  "reason": "one sentence plain-English explanation",
+  "suggestedTier": "standard" | "advanced" | "premium"
+}
+
+Rules:
+- "simple": casual questions, quick lookups, short rewrites, greetings, single-sentence tasks
+- "moderate": multi-step explanations, summaries, short code, structured output
+- "complex": architecture decisions, deep analysis, debugging complex systems, long-form content
+- suggestedTier: "standard" for simple, "advanced" for moderate, "premium" for complex`,
+      messages: [{ role: 'user', content: String(prompt).slice(0, 2000) }],
+    });
+
+    const raw = msg.content[0]?.text?.trim() ?? '';
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    const { complexity, reason, suggestedTier } = JSON.parse(jsonMatch ? jsonMatch[0] : raw);
+
+    // No mismatch if the current model is already the right tier
+    const currentModel = permittedModels.find(m => m.id === currentModelId);
+    if (currentModel?.tier === suggestedTier) return res.json({ mismatch: false });
+
+    // Only suggest models the user is actually permitted to use
+    const suggestedModels = permittedModels
+      .filter(m => m.tier === suggestedTier)
+      .map(m => ({ id: m.id, name: m.name, emoji: m.emoji || '' }));
+
+    if (!suggestedModels.length) return res.json({ mismatch: false });
+
+    logger.info('Model advisor mismatch', {
+      userId: req.user.id, toolSlug, currentModelId, suggestedTier, complexity,
+    });
+
+    return res.json({ mismatch: true, complexity, reason, suggestedTier, suggestedModels });
+  } catch (err) {
+    // Always fall through silently — never block the user from sending
+    logger.warn('analyse-prompt failed', { error: err.message, toolSlug });
+    return res.json({ mismatch: false });
+  }
+});
+
 router.post('/:toolSlug/stream', requireAuth, async (req, res) => {
   const { toolSlug } = req.params;
   const { model, messages, system, maxTokens = 4096 } = req.body;

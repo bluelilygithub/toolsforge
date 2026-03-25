@@ -6,6 +6,7 @@ const InvitationService = require('../services/invitations');
 const PermissionService = require('../services/permissions');
 const EmailTemplateService = require('../services/emailTemplates');
 const { MODEL_CATALOGUE } = require('../utils/modelCatalogue');
+const { updateRateLimitConfig } = require('../middleware/rateLimit');
 const logger = require('../utils/logger');
 
 const router = express.Router();
@@ -154,6 +155,61 @@ router.post('/users/:userId/revoke-role', async (req, res) => {
   }
 });
 
+// ── Security settings ─────────────────────────────────────────────────────────
+
+const SECURITY_KEYS = ['security_login_max_attempts', 'security_lockout_minutes', 'security_login_rate_limit'];
+const SECURITY_DEFAULTS = { security_login_max_attempts: 5, security_lockout_minutes: 15, security_login_rate_limit: 5 };
+
+router.get('/security-settings', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT key, value FROM system_settings WHERE key = ANY($1)`,
+      [SECURITY_KEYS]
+    );
+    const settings = { ...SECURITY_DEFAULTS };
+    for (const row of result.rows) settings[row.key] = Number(row.value);
+    res.json(settings);
+  } catch (err) {
+    logger.error('Fetch security-settings error', { error: err.message });
+    res.status(500).json({ error: 'Failed to fetch security settings' });
+  }
+});
+
+router.put('/security-settings', async (req, res) => {
+  const { security_login_max_attempts, security_lockout_minutes, security_login_rate_limit } = req.body;
+
+  const updates = {};
+  if (security_login_max_attempts !== undefined) updates.security_login_max_attempts = Math.max(1, Math.min(20, parseInt(security_login_max_attempts, 10)));
+  if (security_lockout_minutes    !== undefined) updates.security_lockout_minutes    = Math.max(1, Math.min(1440, parseInt(security_lockout_minutes, 10)));
+  if (security_login_rate_limit   !== undefined) updates.security_login_rate_limit   = Math.max(1, Math.min(20, parseInt(security_login_rate_limit, 10)));
+
+  if (Object.keys(updates).length === 0) {
+    return res.status(400).json({ error: 'No valid settings provided' });
+  }
+
+  try {
+    for (const [key, value] of Object.entries(updates)) {
+      await pool.query(
+        `INSERT INTO system_settings (key, value, updated_by, updated_at)
+         VALUES ($1, $2::jsonb, $3, NOW())
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+        [key, JSON.stringify(value), req.user.id]
+      );
+    }
+
+    // Apply rate limit change immediately (in-process, no restart needed)
+    if (updates.security_login_rate_limit !== undefined) {
+      updateRateLimitConfig({ loginMax: updates.security_login_rate_limit });
+    }
+
+    logger.info('Security settings updated', { updates, updatedBy: req.user.email });
+    res.json({ message: 'Security settings saved', settings: updates });
+  } catch (err) {
+    logger.error('Save security-settings error', { error: err.message });
+    res.status(500).json({ error: 'Failed to save security settings' });
+  }
+});
+
 // Application logs — warn and error entries
 router.get('/logs', async (req, res) => {
   const level  = req.query.level  || null;
@@ -196,6 +252,105 @@ router.get('/logs', async (req, res) => {
   } catch (error) {
     logger.error('Fetch logs error', { error: error.message });
     res.status(500).json({ error: 'Failed to fetch logs' });
+  }
+});
+
+// ── Tool access — per-user, per-tool structured access management ──────────────
+
+// GET /api/admin/users/:userId/tool-access
+// Returns each enabled tool with its grantable roles and the user's current role
+router.get('/users/:userId/tool-access', async (req, res) => {
+  const userId = parseInt(req.params.userId, 10);
+  if (isNaN(userId)) return res.status(400).json({ error: 'Invalid user id' });
+
+  try {
+    const [toolsResult, rolesResult] = await Promise.all([
+      pool.query(`SELECT slug, name, config FROM tools WHERE enabled = true ORDER BY name`),
+      pool.query(
+        `SELECT r.name FROM user_roles ur
+         JOIN roles r ON r.id = ur.role_id
+         WHERE ur.user_id = $1 AND ur.scope_type = 'tool'`,
+        [userId]
+      ),
+    ]);
+
+    const userToolRoleNames = new Set(rolesResult.rows.map(r => r.name));
+
+    const tools = toolsResult.rows.map(tool => {
+      const config = tool.config || {};
+      const configRoles = config.roles ?? [];
+      const roleModelAccess = config.roleModelAccess ?? {};
+
+      // If org_member is in roleModelAccess, every member gets that tier by default
+      const floorTier = roleModelAccess['org_member'] ?? null;
+      const defaultLabel = floorTier
+        ? `${floorTier.charAt(0).toUpperCase() + floorTier.slice(1)} (all members)`
+        : 'No access';
+
+      // User's current explicit role for this tool (take first match if multiple)
+      const currentRole = configRoles.find(r => userToolRoleNames.has(r.name))?.name ?? null;
+
+      return {
+        slug: tool.slug,
+        name: tool.name,
+        defaultLabel,
+        roles: configRoles,
+        currentRole,
+      };
+    });
+
+    res.json({ tools });
+  } catch (err) {
+    logger.error('Fetch tool-access error', { error: err.message });
+    res.status(500).json({ error: 'Failed to fetch tool access' });
+  }
+});
+
+// PUT /api/admin/users/:userId/tool-access
+// Accepts { access: { toolSlug: roleName | null } } — applies diffs per tool
+router.put('/users/:userId/tool-access', async (req, res) => {
+  const userId = parseInt(req.params.userId, 10);
+  if (isNaN(userId)) return res.status(400).json({ error: 'Invalid user id' });
+
+  const { access } = req.body;
+  if (!access || typeof access !== 'object' || Array.isArray(access)) {
+    return res.status(400).json({ error: 'access object is required' });
+  }
+
+  try {
+    const toolSlugs = Object.keys(access);
+    const toolsResult = await pool.query(
+      `SELECT slug, config FROM tools WHERE enabled = true AND slug = ANY($1)`,
+      [toolSlugs]
+    );
+
+    for (const tool of toolsResult.rows) {
+      const configRoles = tool.config?.roles ?? [];
+      const roleNames = configRoles.map(r => r.name);
+      const targetRoleName = access[tool.slug] ?? null;
+
+      // Revoke all existing explicit roles for this tool
+      for (const roleName of roleNames) {
+        await PermissionService.revokeRole(userId, roleName, { type: 'tool', id: tool.slug });
+      }
+
+      // Grant the selected role if specified and valid
+      if (targetRoleName && roleNames.includes(targetRoleName)) {
+        const roleConfig = configRoles.find(r => r.name === targetRoleName);
+        await PermissionService.grantRole(
+          userId,
+          targetRoleName,
+          { type: 'tool', id: roleConfig.scopeId },
+          req.user.id
+        );
+      }
+    }
+
+    logger.info('Tool access updated', { userId, access, updatedBy: req.user.email });
+    res.json({ message: 'Access updated' });
+  } catch (err) {
+    logger.error('Update tool-access error', { error: err.message });
+    res.status(500).json({ error: 'Failed to update tool access' });
   }
 });
 
@@ -369,6 +524,64 @@ router.post('/email-templates/:slug/reset', async (req, res) => {
     logger.error('Reset email template error', { error: error.message });
     const status = error.message.startsWith('No default') ? 404 : 500;
     res.status(status).json({ error: error.message || 'Failed to reset email template' });
+  }
+});
+
+// ── App Settings — file types & default timezone ──────────────────────────────
+
+const APP_SETTINGS_KEYS = ['chat_allowed_file_types', 'default_timezone'];
+const APP_SETTINGS_DEFAULTS = {
+  chat_allowed_file_types: '.pdf,.txt,.md,.csv,.json,.js,.jsx,.ts,.tsx,.py,.html,.css,image/*',
+  default_timezone: 'UTC',
+};
+
+router.get('/app-settings', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT key, value FROM system_settings WHERE key = ANY($1)`,
+      [APP_SETTINGS_KEYS]
+    );
+    const settings = { ...APP_SETTINGS_DEFAULTS };
+    for (const row of result.rows) settings[row.key] = row.value;
+    res.json(settings);
+  } catch (err) {
+    logger.error('Fetch app-settings error', { error: err.message });
+    res.status(500).json({ error: 'Failed to fetch app settings' });
+  }
+});
+
+router.put('/app-settings', async (req, res) => {
+  const updates = {};
+  const { chat_allowed_file_types, default_timezone } = req.body;
+
+  if (chat_allowed_file_types !== undefined) {
+    updates.chat_allowed_file_types = String(chat_allowed_file_types).slice(0, 1000);
+  }
+  if (default_timezone !== undefined) {
+    // Validate it's a recognised IANA timezone
+    try {
+      Intl.DateTimeFormat(undefined, { timeZone: String(default_timezone) });
+      updates.default_timezone = String(default_timezone);
+    } catch {
+      return res.status(400).json({ error: 'Invalid timezone' });
+    }
+  }
+
+  if (!Object.keys(updates).length) return res.status(400).json({ error: 'No valid fields provided' });
+
+  try {
+    for (const [key, value] of Object.entries(updates)) {
+      await pool.query(
+        `INSERT INTO system_settings (key, value, updated_by, updated_at)
+         VALUES ($1, $2::jsonb, $3, NOW())
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+        [key, JSON.stringify(value), req.user.id]
+      );
+    }
+    res.json({ message: 'App settings saved', settings: updates });
+  } catch (err) {
+    logger.error('Save app-settings error', { error: err.message });
+    res.status(500).json({ error: 'Failed to save app settings' });
   }
 });
 

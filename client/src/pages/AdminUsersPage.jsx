@@ -151,7 +151,7 @@ function AdminUsersPage() {
                           className="text-xs px-2 py-1 rounded-lg hover:opacity-70 transition-opacity"
                           style={{ color: 'var(--color-primary)' }}
                         >
-                          Manage Roles
+                          Manage Access
                         </button>
                       </div>
                     </td>
@@ -171,9 +171,10 @@ function AdminUsersPage() {
       )}
 
       {manageUser && (
-        <RoleModal
+        <AccessModal
           user={manageUser}
           onClose={() => setManageUser(null)}
+          onSaved={fetchUsers}
         />
       )}
 
@@ -352,83 +353,43 @@ function InviteModal({ onClose, onInvited }) {
   );
 }
 
-function RoleModal({ user, onClose }) {
-  const [roles, setRoles]         = useState([]);
-  const [toolRoles, setToolRoles] = useState([]);
-  const [loadingRoles, setLoadingRoles] = useState(true);
-  const [grantRole, setGrantRole] = useState('');
-  const [working, setWorking]     = useState(false);
+function AccessModal({ user, onClose, onSaved }) {
+  const [globalRoles, setGlobalRoles] = useState([]);
+  const [tools, setTools]             = useState([]);
+  const [draft, setDraft]             = useState({});   // { toolSlug: roleName | null }
+  const [saved, setSaved]             = useState({});   // snapshot of what was loaded
+  const [loading, setLoading]         = useState(true);
+  const [saving, setSaving]           = useState(false);
+  const [adminWorking, setAdminWorking] = useState(false);
   const showToast = useToast();
-  const getIcon = useIcon();
+  const getIcon   = useIcon();
   const currentUser = useAuthStore(s => s.user);
 
-  const fetchRoles = () => {
-    setLoadingRoles(true);
-    api.get(`/api/admin/users/${user.id}/roles`)
-      .then(r => r.json())
-      .then(data => setRoles(Array.isArray(data) ? data : []))
-      .catch(() => showToast('Failed to load roles', 'error'))
-      .finally(() => setLoadingRoles(false));
-  };
-
   useEffect(() => {
-    fetchRoles();
-    api.get('/api/admin/tool-roles')
-      .then(r => r.json())
-      .then(data => setToolRoles(Array.isArray(data) ? data : []))
-      .catch(() => {});
+    Promise.all([
+      api.get(`/api/admin/users/${user.id}/roles`).then(r => r.json()),
+      api.get(`/api/admin/users/${user.id}/tool-access`).then(r => r.json()),
+    ])
+      .then(([rolesData, accessData]) => {
+        setGlobalRoles(Array.isArray(rolesData) ? rolesData.filter(r => r.scope_type === 'global') : []);
+        const toolList = accessData.tools ?? [];
+        setTools(toolList);
+        const initial = {};
+        for (const t of toolList) initial[t.slug] = t.currentRole;
+        setDraft(initial);
+        setSaved(initial);
+      })
+      .catch(() => showToast('Failed to load access data', 'error'))
+      .finally(() => setLoading(false));
   }, []);
 
-  const assignedToolRoles = roles.filter(r => r.scope_type === 'tool');
-  const globalRoles = roles.filter(r => r.scope_type === 'global');
-  const isAdmin     = globalRoles.some(r => r.name === 'org_admin');
-  const isSelf      = currentUser?.id === user.id;
-
-  const handleGrant = async () => {
-    const target = toolRoles.find(r => r.name === grantRole);
-    if (!target) return;
-    setWorking(true);
-    try {
-      const res = await api.post(`/api/admin/users/${user.id}/grant-role`, {
-        roleName: target.name,
-        scopeType: 'tool',
-        scopeId: target.scopeId,
-      });
-      const data = await res.json();
-      if (!res.ok) { showToast(data.error || 'Failed to grant role', 'error'); return; }
-      showToast('Role granted');
-      fetchRoles();
-    } catch {
-      showToast('Network error', 'error');
-    } finally {
-      setWorking(false);
-    }
-  };
-
-  const handleRevoke = async (role) => {
-    setWorking(true);
-    try {
-      const res = await api.post(`/api/admin/users/${user.id}/revoke-role`, {
-        roleName: role.name,
-        scopeType: role.scope_type,
-        scopeId: role.scope_id,
-      });
-      if (!res.ok) { showToast('Failed to revoke role', 'error'); return; }
-      showToast('Role revoked');
-      fetchRoles();
-    } catch {
-      showToast('Network error', 'error');
-    } finally {
-      setWorking(false);
-    }
-  };
+  const isAdmin = globalRoles.some(r => r.name === 'org_admin');
+  const isSelf  = currentUser?.id === user.id;
+  const isDirty = tools.some(t => draft[t.slug] !== saved[t.slug]);
 
   const handleToggleAdmin = async () => {
-    if (isSelf) {
-      showToast('You cannot change your own admin role', 'error');
-      return;
-    }
-    setWorking(true);
+    if (isSelf) { showToast('You cannot change your own admin role', 'error'); return; }
+    setAdminWorking(true);
     try {
       const endpoint = isAdmin ? 'revoke-role' : 'grant-role';
       const res = await api.post(`/api/admin/users/${user.id}/${endpoint}`, {
@@ -437,12 +398,38 @@ function RoleModal({ user, onClose }) {
       });
       const data = await res.json();
       if (!res.ok) { showToast(data.error || 'Failed to update role', 'error'); return; }
+      setGlobalRoles(prev =>
+        isAdmin
+          ? prev.filter(r => r.name !== 'org_admin')
+          : [...prev, { name: 'org_admin', scope_type: 'global' }]
+      );
       showToast(isAdmin ? 'Admin role removed' : 'Admin role granted');
-      fetchRoles();
+      onSaved();
     } catch {
       showToast('Network error', 'error');
     } finally {
-      setWorking(false);
+      setAdminWorking(false);
+    }
+  };
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      // Only send tools where the value changed
+      const changes = {};
+      for (const t of tools) {
+        if (draft[t.slug] !== saved[t.slug]) changes[t.slug] = draft[t.slug];
+      }
+      const res = await api.put(`/api/admin/users/${user.id}/tool-access`, { access: changes });
+      const data = await res.json();
+      if (!res.ok) { showToast(data.error || 'Failed to save', 'error'); return; }
+      setSaved({ ...draft });
+      showToast('Access updated');
+      onSaved();
+    } catch {
+      showToast('Network error', 'error');
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -453,13 +440,14 @@ function RoleModal({ user, onClose }) {
       onClick={e => { if (e.target === e.currentTarget) onClose(); }}
     >
       <div
-        className="w-full max-w-md rounded-2xl border p-6 space-y-5"
+        className="w-full max-w-md rounded-2xl border p-6 space-y-5 max-h-[90vh] overflow-y-auto"
         style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)' }}
       >
+        {/* Header */}
         <div className="flex items-start justify-between">
           <div>
             <h2 className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>
-              Manage Roles
+              Manage Access
             </h2>
             <p className="text-xs mt-0.5" style={{ color: 'var(--color-muted)' }}>{user.email}</p>
           </div>
@@ -472,113 +460,134 @@ function RoleModal({ user, onClose }) {
           </button>
         </div>
 
-        {/* Organisation role */}
-        <div>
-          <p className="text-xs font-semibold uppercase tracking-wider mb-2" style={{ color: 'var(--color-muted)' }}>
-            Organisation Role
-          </p>
-          {loadingRoles ? (
-            <p className="text-xs" style={{ color: 'var(--color-muted)' }}>Loading…</p>
-          ) : (
-            <div
-              className="flex items-center justify-between px-3 py-2.5 rounded-xl border"
-              style={{ borderColor: 'var(--color-border)', background: 'var(--color-bg)' }}
-            >
-              <div>
-                <p className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>
-                  {isAdmin ? 'org_admin' : 'org_member'}
-                </p>
-                <p className="text-xs" style={{ color: 'var(--color-muted)' }}>
-                  {isAdmin ? 'Full admin access' : 'Standard member'}
-                </p>
-              </div>
-              <button
-                onClick={handleToggleAdmin}
-                disabled={working || isSelf}
-                title={isSelf ? 'You cannot change your own admin role' : undefined}
-                className="text-xs px-2 py-1 rounded-lg hover:opacity-70 transition-opacity disabled:opacity-30"
-                style={{ color: isAdmin ? '#ef4444' : 'var(--color-primary)' }}
+        {loading ? (
+          <div className="flex justify-center py-8">
+            <div className="flex gap-1.5">
+              {[0, 150, 300].map(d => (
+                <span key={d} className="w-2 h-2 rounded-full animate-bounce"
+                  style={{ background: 'var(--color-primary)', animationDelay: `${d}ms` }} />
+              ))}
+            </div>
+          </div>
+        ) : (
+          <>
+            {/* Organisation role */}
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-wider mb-2" style={{ color: 'var(--color-muted)' }}>
+                Organisation
+              </p>
+              <div
+                className="flex items-center justify-between px-3 py-2.5 rounded-xl border"
+                style={{ borderColor: 'var(--color-border)', background: 'var(--color-bg)' }}
               >
-                {isAdmin ? 'Remove admin' : 'Make admin'}
+                <div>
+                  <p className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>
+                    {isAdmin ? 'Administrator' : 'Member'}
+                  </p>
+                  <p className="text-xs" style={{ color: 'var(--color-muted)' }}>
+                    {isAdmin ? 'Full admin access to this panel' : 'Standard organisation member'}
+                  </p>
+                </div>
+                <button
+                  onClick={handleToggleAdmin}
+                  disabled={adminWorking || isSelf}
+                  title={isSelf ? 'You cannot change your own admin role' : undefined}
+                  className="text-xs px-2 py-1 rounded-lg hover:opacity-70 transition-opacity disabled:opacity-30"
+                  style={{ color: isAdmin ? '#ef4444' : 'var(--color-primary)' }}
+                >
+                  {adminWorking ? '…' : isAdmin ? 'Remove admin' : 'Make admin'}
+                </button>
+              </div>
+            </div>
+
+            {/* Tool access — one section per tool */}
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-wider mb-3" style={{ color: 'var(--color-muted)' }}>
+                Tool Access
+              </p>
+              {tools.length === 0 ? (
+                <p className="text-xs" style={{ color: 'var(--color-muted)' }}>No tools configured.</p>
+              ) : (
+                <div className="space-y-4">
+                  {tools.map(tool => (
+                    <div key={tool.slug}>
+                      <p className="text-xs font-medium mb-2" style={{ color: 'var(--color-text)' }}>
+                        {tool.name}
+                      </p>
+                      <div className="space-y-1.5">
+                        {/* Default / floor option */}
+                        <label
+                          className="flex items-center gap-2.5 px-3 py-2 rounded-xl border cursor-pointer transition-colors"
+                          style={{
+                            borderColor: draft[tool.slug] === null ? 'var(--color-primary)' : 'var(--color-border)',
+                            background: draft[tool.slug] === null ? 'rgba(var(--color-primary-rgb),0.06)' : 'var(--color-bg)',
+                          }}
+                        >
+                          <input
+                            type="radio"
+                            name={`tool-${tool.slug}`}
+                            checked={draft[tool.slug] === null}
+                            onChange={() => setDraft(d => ({ ...d, [tool.slug]: null }))}
+                            className="accent-[var(--color-primary)]"
+                          />
+                          <div>
+                            <p className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>
+                              {tool.defaultLabel}
+                            </p>
+                          </div>
+                        </label>
+
+                        {/* Upgrade tier options */}
+                        {tool.roles.map(role => (
+                          <label
+                            key={role.name}
+                            className="flex items-center gap-2.5 px-3 py-2 rounded-xl border cursor-pointer transition-colors"
+                            style={{
+                              borderColor: draft[tool.slug] === role.name ? 'var(--color-primary)' : 'var(--color-border)',
+                              background: draft[tool.slug] === role.name ? 'rgba(var(--color-primary-rgb),0.06)' : 'var(--color-bg)',
+                            }}
+                          >
+                            <input
+                              type="radio"
+                              name={`tool-${tool.slug}`}
+                              checked={draft[tool.slug] === role.name}
+                              onChange={() => setDraft(d => ({ ...d, [tool.slug]: role.name }))}
+                              className="accent-[var(--color-primary)]"
+                            />
+                            <div>
+                              <p className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>
+                                {role.label.replace(`${tool.name} — `, '')}
+                              </p>
+                            </div>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Actions */}
+            <div className="flex gap-2 pt-1" style={{ borderTop: '1px solid var(--color-border)' }}>
+              <button
+                onClick={onClose}
+                className="flex-1 mt-4 py-2.5 rounded-xl text-sm border transition-opacity hover:opacity-70"
+                style={{ borderColor: 'var(--color-border)', color: 'var(--color-muted)' }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleSave}
+                disabled={saving || !isDirty}
+                className="flex-1 mt-4 py-2.5 rounded-xl text-sm font-semibold text-white transition-opacity hover:opacity-80 disabled:opacity-40"
+                style={{ background: 'var(--color-primary)' }}
+              >
+                {saving ? 'Saving…' : 'Save Changes'}
               </button>
             </div>
-          )}
-        </div>
-
-        {/* Current tool roles */}
-        <div>
-          <p className="text-xs font-semibold uppercase tracking-wider mb-2" style={{ color: 'var(--color-muted)' }}>
-            Tool Access
-          </p>
-          {loadingRoles ? (
-            <p className="text-xs" style={{ color: 'var(--color-muted)' }}>Loading…</p>
-          ) : assignedToolRoles.length === 0 ? (
-            <p className="text-xs" style={{ color: 'var(--color-muted)' }}>No tool access granted.</p>
-          ) : (
-            <div className="space-y-2">
-              {assignedToolRoles.map(role => (
-                <div
-                  key={`${role.name}-${role.scope_id}`}
-                  className="flex items-center justify-between px-3 py-2.5 rounded-xl border"
-                  style={{ borderColor: 'var(--color-border)', background: 'var(--color-bg)' }}
-                >
-                  <div>
-                    <p className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>{role.name}</p>
-                    <p className="text-xs" style={{ color: 'var(--color-muted)' }}>
-                      {role.scope_type} · {role.scope_id}
-                    </p>
-                  </div>
-                  <button
-                    onClick={() => handleRevoke(role)}
-                    disabled={working}
-                    className="text-xs px-2 py-1 rounded-lg hover:opacity-70 transition-opacity disabled:opacity-30"
-                    style={{ color: '#ef4444' }}
-                  >
-                    Revoke
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* Grant new role */}
-        <div className="pt-1" style={{ borderTop: '1px solid var(--color-border)' }}>
-          <p className="text-xs font-semibold uppercase tracking-wider mb-3 mt-4" style={{ color: 'var(--color-muted)' }}>
-            Grant Access
-          </p>
-          <div className="flex gap-2">
-            <select
-              value={grantRole}
-              onChange={e => setGrantRole(e.target.value)}
-              className="flex-1 px-3 py-2.5 rounded-xl border text-sm outline-none"
-              style={{ background: 'var(--color-bg)', borderColor: 'var(--color-border)', color: grantRole ? 'var(--color-text)' : 'var(--color-muted)' }}
-            >
-              <option value="" disabled>Select a role…</option>
-              {/* Group by tool name */}
-              {Object.entries(
-                toolRoles.reduce((acc, r) => {
-                  (acc[r.toolName] = acc[r.toolName] || []).push(r);
-                  return acc;
-                }, {})
-              ).map(([toolName, roles]) => (
-                <optgroup key={toolName} label={toolName}>
-                  {roles.map(r => (
-                    <option key={r.name} value={r.name}>{r.label}</option>
-                  ))}
-                </optgroup>
-              ))}
-            </select>
-            <button
-              onClick={handleGrant}
-              disabled={working || !grantRole}
-              className="px-4 py-2.5 rounded-xl text-sm font-semibold text-white transition-opacity hover:opacity-80 disabled:opacity-50"
-              style={{ background: 'var(--color-primary)' }}
-            >
-              Grant
-            </button>
-          </div>
-        </div>
+          </>
+        )}
       </div>
     </div>
   );
