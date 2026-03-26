@@ -2,7 +2,7 @@
 
 **Built by:** Michael Barrett
 **Purpose:** Multi-user modular platform — a foundation for building shared AI tools across an organisation
-**Status:** Production-ready multi-tenant platform — auth, roles, permission service, invitation workflow, email delivery, password reset, profile management, password history, account lockout, configurable security settings, structured logging, in-app log viewer, email template management, font/theme customisation, AI model catalogue, role-based model permissions, SSE streaming backbone, AI Chat tool, Model Advisor, admin UI, server-side file ingestion pipeline (PDF/Word/Excel/text), vector embeddings with HNSW similarity search, org-scoped RAG, usage telemetry, admin usage analytics, client-side route guards (RequireAuth + RequireRole), theme-aware dashboard, tool registry with role-filtered card grid
+**Status:** Production-ready multi-tenant platform — auth, roles, permission service, invitation workflow, email delivery, password reset, profile management, password history, account lockout, configurable security settings, structured logging, in-app log viewer, email template management, font/theme customisation, AI model catalogue, role-based model permissions, SSE streaming backbone, AI Chat tool, Model Advisor, admin UI, server-side file ingestion pipeline (PDF/Word/Excel/text), vector embeddings with HNSW similarity search, org-scoped RAG, usage telemetry, admin usage analytics, client-side route guards (RequireAuth + RequireRole), theme-aware dashboard, tool registry with role-filtered card grid, **AgentOrchestrator ReAct loop engine** (tool-agnostic Claude + tool-use execution primitive shared by all agent modules)
 **Stack:** Node.js/Express · PostgreSQL 15 + pgvector · Docker · Railway · React/Vite · Tailwind CSS · Anthropic Claude · Google text-embedding-004
 
 ---
@@ -196,6 +196,110 @@ Response (no mismatch):
 ```
 
 **Critical:** `suggestedModels` is built exclusively from `PermissionService.getPermittedModels(userId, toolSlug)` filtered to the suggested tier. A user without `chat_premium` access can never receive Opus as a suggestion, regardless of prompt complexity. If the classifier call itself fails for any reason the endpoint returns `{ mismatch: false }` — the user is never blocked from sending.
+
+#### AgentOrchestrator (`server/services/AgentOrchestrator.js`)
+
+The platform-level ReAct loop engine. Every agent module in ToolsForge runs through this — nothing domain-specific lives here.
+
+**What it does:** accepts a `systemPrompt`, `userMessage`, tool definitions, and a `context` object, then executes a Claude → parse tool calls → execute tools → feed results back → repeat loop until Claude emits a final answer or `maxIterations` is reached.
+
+**Imports:**
+```js
+// Singleton (recommended)
+const { agentOrchestrator } = require('../services/AgentOrchestrator');
+
+// Or instantiate with a custom logger
+const { AgentOrchestrator } = require('../services/AgentOrchestrator');
+const orchestrator = new AgentOrchestrator({ logger: myLogger });
+```
+
+**`run(params)` signature:**
+```js
+const { result, trace, iterations, tokensUsed } = await agentOrchestrator.run({
+  systemPrompt,          // string
+  userMessage,           // string
+  tools,                 // array — see Tool Shape below
+  maxIterations,         // number, default 10, hard-capped at 20
+  onStep,                // optional async (traceStep) => void — called after each iteration
+  context,               // { userId, orgId, toolSlug } — REQUIRED
+  model,                 // string, default 'claude-sonnet-4-6'
+  maxTokens,             // number, default 8192; pass 65536 for complex agents
+  thinking,              // { enabled: false, budgetTokens: 10000 } — extended thinking
+});
+```
+
+**Tool shape** — each tool carries both the Anthropic schema and an `execute` function. The orchestrator strips `execute` before sending to Claude:
+```js
+{
+  name: 'search_web',
+  description: 'Search the web for current information.',
+  input_schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
+  execute: async (input, context) => { /* context.orgId always available */ return { results: [...] }; }
+}
+```
+
+**Returns:**
+```js
+{
+  result: string,          // final text response from Claude
+  iterations: number,      // how many iterations ran
+  trace: [                 // one entry per iteration
+    {
+      iteration: 1,
+      timestamp: '2026-03-26T...',
+      thinking: null,      // string if extended thinking was enabled
+      text: null,          // Claude's text content this iteration (null if mid-loop)
+      toolCalls: [{ id, name, input }],
+      toolResults: [{ id, name, result, durationMs }],
+    }
+  ],
+  tokensUsed: { input, output, cacheRead, cacheWrite }
+             // shape matches usageLogger.logAndCheck() — call it directly after run()
+}
+```
+
+**`AgentOrchestrator.formatForSSE(traceStep)`** — static method. Returns a plain JSON-serialisable object from a trace step, safe to pass directly to `res.write()` in an SSE route:
+```js
+sendEvent(res, AgentOrchestrator.formatForSSE(traceStep));
+// → { type: 'agent_step', iteration, timestamp, thinking, text, toolCalls, toolResults }
+```
+
+**Security constraints (non-negotiable):**
+- `context.orgId` is required — throws `AgentError` immediately if absent
+- `maxIterations` is silently clamped to 20 regardless of what the caller passes
+- Tool execution errors are caught per-tool and returned to Claude as `{ error: '...' }` — never thrown up the stack; Claude decides how to handle tool failure
+- Unknown tool names return `{ error: 'Tool not found: <name>' }` to Claude and continue; never throw
+- `context` is passed through to every `tool.execute(input, context)` call — tools use `orgId` for data scoping
+
+**Extended thinking:**
+```js
+// Disabled by default. When enabled, budget_tokens must be < maxTokens.
+// Supported on Claude 4+ models (claude-opus-4-6, claude-sonnet-4-6) without betas.
+thinking: { enabled: true, budgetTokens: 10000 }
+```
+Thinking blocks are captured in `traceStep.thinking` and preserved verbatim in assistant turns (required by the Anthropic API for multi-turn extended thinking — stripping them causes an API error on the next call).
+
+**Errors:** all failures throw `AgentError` (also exported) with `{ iterations, trace, cause }` attached:
+```js
+const { AgentError } = require('../services/AgentOrchestrator');
+
+try {
+  const { result } = await agentOrchestrator.run({ ... });
+} catch (err) {
+  if (err instanceof AgentError) {
+    logger.error('Agent failed', { error: err.message, iterations: err.iterations });
+    // err.trace contains all steps up to the failure
+  }
+}
+```
+
+**Usage accounting** — the orchestrator returns raw token counts; the caller is responsible for logging:
+```js
+const { result, tokensUsed } = await agentOrchestrator.run({ ... });
+await logAndCheck({ userId, toolSlug, modelId: model, ...tokensUsed });
+```
+
+---
 
 #### File Ingestion Pipeline
 
@@ -591,6 +695,7 @@ server/
     emailTemplates.js          # EmailTemplateService — DB-backed template CRUD + {{variable}} render
     costCalculator.js          # Async cost calculator — reads pricing from DB model catalogue
     usageLogger.js             # logUsage + checkSpendThresholds + logAndCheck
+    AgentOrchestrator.js       # ReAct loop engine — Claude + tool-use execution primitive; exports { AgentOrchestrator, AgentError, agentOrchestrator }
     chunkingService.js         # chunkText(text, targetTokens, overlapTokens) — ~500 token chunks, 50 token overlap
     embeddingService.js        # embedText / embedBatch — Google text-embedding-004 (768-dim), lazy client init
     telemetryService.js        # recordEvent(orgId, userId, eventType, metadata) — fire-and-forget, never throws
@@ -1344,14 +1449,27 @@ Current date injection is the highest-value, lowest-effort item — one utility 
 
 ## What's Next
 
-- [ ] Chat — current date injection (`getSystemDateContext()` utility, one line in system prompt)
+### Agent Platform
+
+- [ ] First domain agent — build a concrete agent module using `AgentOrchestrator` (e.g. Google Ads analyser, research agent) to validate the tool-definition + execute pattern end-to-end
+- [ ] SSE agent route — stream `AgentOrchestrator.formatForSSE(traceStep)` events to the client so users can watch the ReAct loop in real time; reuse `stream.js` SSE helpers
+- [ ] Agent tool registry — a DB-backed table of tool definitions so admin can enable/disable tools per-agent without a redeploy
+- [ ] Agent usage accounting — wire `tokensUsed` from `agentOrchestrator.run()` into `logAndCheck()` at the route layer; aggregate across all iterations per request
+
+### Chat Improvements
+
+- [x] Chat — voice I/O (`useSpeechInput` hook + `VoiceInputButton` primitive) ✓
+- [x] Chat — read aloud (`useReadAloud` hook + `ReadAloudButton` primitive) ✓
+- [x] Chat — image paste (`useClipboardMedia` hook + inline preview) ✓
+- [x] Chat — file attachments (`useFileAttachment` hook + paperclip button) ✓
+- [x] Chat — current date injection (timezone-aware system prompt, three-tier resolution) ✓
 - [ ] Chat — show more / show less (`<CollapsibleContent />` component around long responses)
 - [ ] Chat — convert to Markdown (export utility + button)
-- [ ] Chat — voice I/O (`useVoice` hook + `<VoiceButton />` primitive)
-- [ ] Chat — image paste (`useClipboardMedia` hook + inline preview)
 - [ ] Chat — follow-up question chips (`appendFollowUpRequest` utility + `<FollowUpChips />`)
-- [ ] Chat — file uploads (server pipeline + `useFileAttachment` hook)
 - [ ] Chat — URL attachment (server fetch + SSRF guard + `useUrlAttachment` hook)
+
+### Platform
+
 - [ ] Usage dashboard — admin view of token spend by user, tool, and model with date range filters (`usage_logs` table is ready)
 - [ ] Per-user spend caps — `user_settings` key for a personal daily/monthly limit checked in `usageLogger.checkSpendThresholds`
 - [ ] Active sessions panel — show user where they're logged in, "sign out everywhere" button (`auth_sessions` table is ready)

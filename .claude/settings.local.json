@@ -19,7 +19,8 @@
       "Bash(node:*)",
       "Bash(git:*)",
       "Bash(sed -i \"s|from ''../store/authStore''|from ''../stores/authStore''|g\" \"C:/Users/micha/Local Sites/toolsforge/client/src/hooks/useStream.js\")",
-      "Bash(sed -i \"s|from ''../store/settingsStore''|from ''../stores/settingsStore''|g\" \"C:/Users/micha/Local Sites/toolsforge/client/src/providers/ThemeProvider.jsx\")"
+      "Bash(sed -i \"s|from ''../store/settingsStore''|from ''../stores/settingsStore''|g\" \"C:/Users/micha/Local Sites/toolsforge/client/src/providers/ThemeProvider.jsx\")",
+      "Bash(ls:*)"
     ]
   }
 }
