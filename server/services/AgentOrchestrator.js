@@ -162,7 +162,7 @@ class AgentOrchestrator {
     // Strip execute functions before sending schemas to the Anthropic API.
     // Keep a name-keyed map for dispatch during tool execution.
     const anthropicTools = tools.length > 0
-      ? tools.map(({ execute: _exec, ...schema }) => schema)
+      ? tools.map(({ execute: _exec, requiredPermissions: _perms, toolSlug: _slug, ...schema }) => schema)
       : undefined;
 
     const toolMap = Object.fromEntries(tools.map(t => [t.name, t]));

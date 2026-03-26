@@ -357,6 +357,106 @@ Every future agent module in ToolsForge gets the following for free by building 
 
 ---
 
+## Google Ads API Authentication
+
+Lessons from getting the Google Ads API working for the first time in a Node.js project.
+
+- **Google Ad Manager API vs Google Ads API — completely different products.** Ad Manager is for publishers monetising ad inventory (think media companies). Google Ads API is for advertisers managing their own campaigns. Common search results conflate the two. If you see "Ad Manager API" in a guide, it's the wrong product.
+
+- **Manager Account (MCC) is required to obtain a developer token.** Standalone advertiser accounts have no API Centre section in their Google Ads settings. You must create or link to a Manager Account first, then apply for a developer token from the Manager Account's API Centre. This is not documented clearly in the getting-started guides.
+
+- **Explorer access level is sufficient for internal single-account use.** Explorer is the default token tier granted automatically. Standard access requires a more involved application and review. If your use case is querying your own accounts only (not building a multi-client product), Explorer access covers everything you need.
+
+- **Service Account credentials vs OAuth2 client credentials — both exist, only OAuth2 client works for Ads.** The Google Cloud project may have both a Service Account JSON and an OAuth2 Client ID. For Google Ads API, the OAuth2 Client ID + refresh token is the correct auth path. Service Account auth is not supported for Google Ads API (unlike Google Analytics or BigQuery).
+
+- **`login-customer-id` vs `customer_id` — both required when authenticating through a Manager Account.** `customer_id` in the URL is the advertiser account being queried. `login-customer-id` in the request header is the Manager Account through which authentication was granted. Omitting the header causes `CUSTOMER_NOT_FOUND`. Both must be present.
+
+- **`cost_micros` pattern — all Google Ads monetary values are in micros.** Every cost, budget, and CPC field returns an integer representing millionths of the currency unit. Divide by 1,000,000 for a human-readable AUD value. Never store micros in the DB without documenting the unit explicitly.
+
+- **`google-ads-api` by Opteo (npm) vs official Google library — Opteo is the correct choice for Node.js.** The official Google Ads API client library is Java and Python only. `google-ads-api` by Opteo is the standard community library used in the Node.js ecosystem. Alternatively, use `googleapis` for OAuth2 token management and Node's built-in `fetch` for direct REST calls to `googleads.googleapis.com` — this avoids an extra package if `googleapis` is already installed.
+
+- **`search_term_view` is the high-intent signal source.** This resource contains the actual user queries that triggered your ads (not just the keywords you bid on). It's the most valuable data for AI analysis — you can see what real users are searching for. Sorted by clicks, it surfaces the terms driving the most traffic.
+
+- **Refresh token is long-lived; access token expires hourly.** The OAuth2 flow produces a refresh token (stored in `.env`, essentially permanent) and a short-lived access token. The `googleapis` OAuth2 client automatically exchanges the refresh token for a new access token when the current one expires. No manual token rotation needed.
+
+- **GAQL date filtering without date segmentation returns aggregated totals.** In Google Ads Query Language, if you include `segments.date` in `SELECT`, you get one row per entity per day. If you filter by `segments.date BETWEEN '...' AND '...'` in `WHERE` without selecting it, the API returns aggregated metrics for the entire period — one row per entity. Use this for campaign performance totals; add `segments.date` to SELECT only when you need daily breakdowns.
+
+- **Google Ads API versions sunset aggressively — always check developers.google.com/google-ads/api/docs/release-notes before starting.** v18 was already sunset when GoogleAdsService was first written; v19 was sunset February 11, 2026. As of March 2026 the current version is v23. Keep the version in a single `API_VERSION` constant so it's a one-line change each cycle.
+
+---
+
+## Google Analytics Data API (GA4)
+
+Lessons from integrating the Google Analytics Data API v1beta into a Node.js project.
+
+- **GA4 Data API vs Universal Analytics Reporting API — completely different products.** The old UA API (`analyticsreporting.googleapis.com`) is decommissioned. GA4 uses the Analytics Data API (`analyticsdata.googleapis.com`). If search results reference `v4` or `analyticsreporting`, they are for the deprecated UA product. The GA4 API is at `analyticsdata.googleapis.com/v1beta`.
+
+- **Same OAuth2 refresh token covers both Google Ads and Google Analytics.** The `get-google-refresh-token.js` script requests both `adwords` and `analytics.readonly` scopes in a single grant. One refresh token, two APIs — no separate auth flow needed. The `googleapis` OAuth2 client rotates the access token automatically for both.
+
+- **Property ID is numeric only — no `properties/` prefix in env var.** The GA4 property ID in Admin → Property Settings is a plain number (e.g. `314159265`). The service prepends `properties/` in the URL itself: `properties/${propertyId}:runReport`. Storing the raw number in env is cleaner and avoids double-prefix bugs.
+
+- **GA4 response rows are parallel arrays, not named keys.** The API returns `dimensionHeaders`, `metricHeaders`, and `rows[]`. Each row has `dimensionValues[]` and `metricValues[]` in the same order as the headers. You must zip them yourself. The `_parseRows()` helper in `GoogleAnalyticsService` does this — it's the pattern to reuse for any new report method.
+
+- **GA4 date dimension returns `YYYYMMDD`, not `YYYY-MM-DD`.** Dates in `segments.date` come back as `"20240115"` (no dashes). Convert with `normDate()` before returning to callers. Every other part of the platform uses ISO format with dashes — inconsistency here would break charts.
+
+- **`bounceRate` is a decimal fraction (0–1), not a percentage (0–100).** GA4 returns `"0.4532"` meaning 45.32%. Do not multiply by 100 before storing or returning — let the frontend or chart library format it. Document the unit clearly in the return type JSDoc.
+
+- **`averageSessionDuration` is in seconds.** GA4 returns session duration as a decimal number of seconds (e.g. `"127.5"` = 2 min 7.5 sec). Named `avgSessionDuration` in the service return shape to make the unit obvious from the property name.
+
+- **Metric filters use `numericFilter` with `doubleValue`, not `intValue`.** To filter rows where `conversions > 0`, the filter body is `{ filter: { fieldName: "conversions", numericFilter: { operation: "GREATER_THAN", value: { doubleValue: 0 } } } }`. Using `int64Value: "0"` or `intValue` will fail silently or error — `doubleValue` is the correct key for fractional metric comparisons.
+
+- **`googleapis` package includes `analyticsdata` — no extra npm package needed.** `google.analyticsdata('v1beta')` is available once `googleapis` is installed. However, the same OAuth2 + raw `fetch` pattern used by `GoogleAdsService` keeps both services consistent and avoids the overhead of the generated client's serialisation layer.
+
+---
+
+## Wiring Domain Services into the Agent Platform
+
+Lessons from building the first domain agent (googleAdsMonitor) on top of the ToolsForge agent platform.
+
+- **AgentOrchestrator must strip all non-Anthropic tool fields before sending schemas to Claude.** The Anthropic API only accepts `name`, `description`, and `input_schema` on tool objects. Platform tool objects also carry `execute`, `requiredPermissions`, and `toolSlug`. The original orchestrator only stripped `execute` — causing a `400 Extra inputs are not permitted` error on every real agent run. Fix: destructure all three internal fields out before building `anthropicTools`:
+  ```js
+  tools.map(({ execute: _e, requiredPermissions: _p, toolSlug: _s, ...schema }) => schema)
+  ```
+  This was a pre-existing bug that affected all registered tools. It only surfaced on the first real end-to-end run.
+
+- **`toolSlug` on tool definitions is a security boundary, not just a filter.** A tool registered with `toolSlug: 'google-ads-monitor'` is invisible to any agent running with a different `context.toolSlug`. This is enforced inside `ToolRegistry.getAvailableTools()`. The agent module should always force `toolSlug` onto the context when calling both `getAvailableTools()` and `agentOrchestrator.run()` — do not trust that the caller passed the right slug.
+
+- **Agent modules register tools as a side effect of `require()`, not via an explicit init call.** `require('./tools')` in `index.js` runs the registrations immediately. This is consistent with how Node.js modules work and means no `init()` step is needed. The singleton `toolRegistry` is shared across all importers via the require cache.
+
+- **Wrap `stateManager.saveConclusion()` in a try-catch in every agent entry point.** The agent run itself (API calls + Claude loop) must not fail just because DB persistence fails. Test contexts use non-integer orgIds that cause type errors in Postgres. Wrap the save, log the error, and always return the analysis result to the caller regardless.
+
+- **Claude uses all tools in a single iteration when given good tool descriptions.** With clear descriptions explaining *when* to call each tool, Claude called all four tools (`get_campaign_performance`, `get_daily_performance`, `get_search_terms`, `get_analytics_overview`) in a single parallel batch on iteration 1, then produced the full analysis on iteration 2. Total: 2 iterations, ~75 seconds, 12,392 tokens. This is efficient — the system prompt's "gather first, then analyse" instruction is doing real work.
+
+- **The system prompt must specify tool-call order explicitly.** If you don't tell Claude which tools to call and in what order, it may call them one at a time across multiple iterations, wasting context and time. A numbered list ("1. Call get_campaign_performance first... 2. Call get_daily_performance...") is the correct pattern.
+
+- **`integer` is valid in Anthropic tool input schemas.** Using `type: 'integer'` for the `days` parameter works correctly with the Claude API. The platform `_validateInput()` in ToolRegistry doesn't check `integer` (it only knows `number`), so it falls through to the skip path — meaning integer constraint is enforced by Claude's own schema handling, not by the platform validator. This is acceptable for simple numeric inputs.
+
+### Status at v0.2.0 (March 2026)
+
+**AGENT LAYER COMPLETE:**
+- `server/agents/googleAdsMonitor/tools.js` — 4 tools registered (toolSlug: `google-ads-monitor`)
+- `server/agents/googleAdsMonitor/prompt.js` — analyst system prompt with gather-first protocol
+- `server/agents/googleAdsMonitor/index.js` — `runAdsMonitor(context)` entry point
+- End-to-end verified: 2 iterations, ~75s, 12,392 tokens, all 4 tools called in parallel on iter 1
+
+**BUG FIXED — `AgentOrchestrator.js`:**
+- Was sending `execute`, `requiredPermissions`, and `toolSlug` to Anthropic API → 400 error on every real run
+- Fix: strip all three internal fields before building `anthropicTools` array
+- Applies to all future agents on the platform — no per-agent workaround needed
+
+**KNOWN LIMITATION:**
+- `StateManager.saveConclusion()` requires a valid integer `orgId`
+- Test runs with `orgId: 'test'` log a warning but complete successfully
+- Resolves automatically when agent runs via authenticated routes (real `orgId` from DB)
+
+**NEXT SESSION — routes + scheduling + UI:**
+- `POST /api/agents/google-ads-monitor/run` — trigger run, stream steps via SSE
+- `GET /api/agents/google-ads-monitor/history` — return past conclusions
+- `AgentScheduler` registration for twice-daily automated runs
+- React UI: report view with charts and AI suggestions panel
+
+---
+
 ## Working with Claude Code
 
 Lessons about the development process itself — how to get better results when using Claude Code to build modules in this project.

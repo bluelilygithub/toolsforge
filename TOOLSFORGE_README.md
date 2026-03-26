@@ -3,7 +3,7 @@
 **Built by:** Michael Barrett
 **Purpose:** Multi-user modular platform — a foundation for building shared AI tools across an organisation
 **Status:** Production-ready multi-tenant platform — auth, roles, permission service, invitation workflow, email delivery, password reset, profile management, password history, account lockout, configurable security settings, structured logging, in-app log viewer, email template management, font/theme customisation, AI model catalogue, role-based model permissions, SSE streaming backbone, AI Chat tool, Model Advisor, admin UI, server-side file ingestion pipeline (PDF/Word/Excel/text), vector embeddings with HNSW similarity search, org-scoped RAG, usage telemetry, admin usage analytics, client-side route guards (RequireAuth + RequireRole), theme-aware dashboard, tool registry with role-filtered card grid, **AgentOrchestrator ReAct loop engine** (tool-agnostic Claude + tool-use execution primitive shared by all agent modules)
-**Stack:** Node.js/Express · PostgreSQL 15 + pgvector · Docker · Railway · React/Vite · Tailwind CSS · Anthropic Claude · Google text-embedding-004
+**Stack:** Node.js/Express · PostgreSQL 15 + pgvector · Docker · Railway · React/Vite · Tailwind CSS · Anthropic Claude · Google text-embedding-004 · Google Ads API v18
 
 ---
 
@@ -298,6 +298,61 @@ try {
 const { result, tokensUsed } = await agentOrchestrator.run({ ... });
 await logAndCheck({ userId, toolSlug, modelId: model, ...tokensUsed });
 ```
+
+---
+
+#### GoogleAdsService (`server/services/GoogleAdsService.js`)
+
+Google Ads API v23 data layer. Handles OAuth2 token refresh automatically via `googleapis`; makes REST calls directly using Node's built-in `fetch`. All monetary values returned in AUD (cost_micros ÷ 1,000,000).
+
+**Auth requirements:**
+- Manager Account (MCC) required — standalone advertiser accounts cannot obtain a developer token
+- `login-customer-id` header must be the Manager Account ID, not the advertiser ID
+- Developer token at Explorer access level is sufficient for internal single-account use
+- Refresh token is long-lived; access token expires hourly — `googleapis` OAuth2 client rotates automatically
+
+| Method | Description |
+|---|---|
+| `getCampaignPerformance(days=30)` | Campaign totals: id, name, status, budget, impressions, clicks, cost, conversions, ctr, avgCpc |
+| `getDailyPerformance(days=30)` | Account-level daily totals (customer resource): date, impressions, clicks, cost, conversions — ordered ASC for charting |
+| `getSearchTerms(days=30)` | Top 50 search terms by clicks: term, status, impressions, clicks, cost, conversions, ctr — the high-intent signal for AI analysis |
+| `getBudgetPacing()` | THIS_MONTH spend vs budget per campaign: name, monthlyBudget, spentToDate |
+
+---
+
+#### GoogleAnalyticsService (`server/services/GoogleAnalyticsService.js`)
+
+Google Analytics Data API v1beta (GA4) data layer. Same OAuth2 pattern as GoogleAdsService — `googleapis` for token rotation, Node `fetch` for REST calls. The same refresh token covers both services (`analytics.readonly` scope included at grant time).
+
+**Required env var:** `GOOGLE_GA4_PROPERTY_ID` — numeric GA4 property ID (Admin → Property Settings → Property ID).
+
+| Method | Description |
+|---|---|
+| `getSessionsOverview(days=30)` | Daily sessions, activeUsers, newUsers, bounceRate — ordered by date ASC for charting |
+| `getTrafficSources(days=30)` | Paid vs organic vs direct: channel, sessions, conversions, totalRevenue — ordered by sessions DESC |
+| `getLandingPagePerformance(days=30)` | Top 20 landing pages: page, sessions, conversions, bounceRate, avgSessionDuration (seconds) |
+| `getConversionEvents(days=30)` | Events with conversions > 0, by event name + date: event, date, eventCount, conversions |
+
+---
+
+#### Google Ads Monitor Agent (`server/agents/googleAdsMonitor/`)
+
+First domain agent. Wires `GoogleAdsService` and `GoogleAnalyticsService` into the platform ReAct loop to produce a full campaign performance report with specific, number-backed recommendations.
+
+**Entry point:** `runAdsMonitor(context)` — `context` must include `{ userId, orgId, toolSlug: 'google-ads-monitor' }`.
+
+**Tools registered (toolSlug: `google-ads-monitor`):**
+
+| Tool | Calls | Returns |
+|---|---|---|
+| `get_campaign_performance` | `googleAdsService.getCampaignPerformance(days)` | Per-campaign totals: budget, impressions, clicks, cost, conversions, ctr, avgCpc |
+| `get_daily_performance` | `googleAdsService.getDailyPerformance(days)` | Account-level daily spend and conversion trends |
+| `get_search_terms` | `googleAdsService.getSearchTerms(days)` | Top 50 user search queries by clicks — the high-intent signal source |
+| `get_analytics_overview` | `googleAnalyticsService.getSessionsOverview(days)` | Daily GA4 sessions, users, and bounce rate for correlation with ad spend |
+
+**Output sections:** Summary → Campaign Analysis → Search Term Insights (converting / wasted spend / ad copy opportunities) → Recommendations (numbered, specific, prioritised by impact).
+
+**Conclusion persistence:** saves to `agent_conclusions` via `stateManager.saveConclusion()`. Persistence errors are caught and logged — the analysis is returned regardless.
 
 ---
 
@@ -696,6 +751,16 @@ server/
     costCalculator.js          # Async cost calculator — reads pricing from DB model catalogue
     usageLogger.js             # logUsage + checkSpendThresholds + logAndCheck
     AgentOrchestrator.js       # ReAct loop engine — Claude + tool-use execution primitive; exports { AgentOrchestrator, AgentError, agentOrchestrator }
+    ToolRegistry.js            # Platform tool management — register/discover/execute tools; exports { ToolRegistry, ValidationError, toolRegistry }
+    StateManager.js            # Org-scoped agent memory — key-value state + run conclusions; exports { StateManager, stateManager }
+    AgentScheduler.js          # Cron + manual agent scheduling — register/trigger/pause/resume/history; exports { AgentScheduler, AgentSchedulerError, agentScheduler }
+    GoogleAdsService.js        # Google Ads API v23 client — campaign perf, daily trends, search terms, budget pacing; exports { GoogleAdsService, googleAdsService }
+    GoogleAnalyticsService.js  # GA4 Data API v1beta client — sessions, traffic sources, landing pages, conversion events; exports { GoogleAnalyticsService, googleAnalyticsService }
+  agents/
+    googleAdsMonitor/
+      tools.js   # 4 tools registered into ToolRegistry (toolSlug: 'google-ads-monitor'): get_campaign_performance, get_daily_performance, get_search_terms, get_analytics_overview
+      prompt.js  # SYSTEM_PROMPT — analyst role, data-gathering protocol, output format (Summary / Campaign Analysis / Search Term Insights / Recommendations)
+      index.js   # runAdsMonitor(context) — getAvailableTools → agentOrchestrator.run → stateManager.saveConclusion → { result, trace, tokensUsed }
     chunkingService.js         # chunkText(text, targetTokens, overlapTokens) — ~500 token chunks, 50 token overlap
     embeddingService.js        # embedText / embedBatch — Google text-embedding-004 (768-dim), lazy client init
     telemetryService.js        # recordEvent(orgId, userId, eventType, metadata) — fire-and-forget, never throws
@@ -1451,10 +1516,20 @@ Current date injection is the highest-value, lowest-effort item — one utility 
 
 ### Agent Platform
 
-- [ ] First domain agent — build a concrete agent module using `AgentOrchestrator` (e.g. Google Ads analyser, research agent) to validate the tool-definition + execute pattern end-to-end
-- [ ] SSE agent route — stream `AgentOrchestrator.formatForSSE(traceStep)` events to the client so users can watch the ReAct loop in real time; reuse `stream.js` SSE helpers
-- [ ] Agent tool registry — a DB-backed table of tool definitions so admin can enable/disable tools per-agent without a redeploy
-- [ ] Agent usage accounting — wire `tokensUsed` from `agentOrchestrator.run()` into `logAndCheck()` at the route layer; aggregate across all iterations per request
+**COMPLETE (v0.2.0):**
+- [x] First domain data layer — `GoogleAdsService` (campaign perf, daily trends, search terms, budget pacing) ✓
+- [x] Second domain data layer — `GoogleAnalyticsService` (sessions, traffic sources, landing pages, conversion events) ✓
+- [x] First domain agent — `googleAdsMonitor` (tools.js + prompt.js + index.js) — end-to-end verified ✓
+- [x] **AgentOrchestrator bug fixed** — was sending `execute`, `requiredPermissions`, `toolSlug` to Anthropic API (400 error); now strips all three internal fields. Fix applies to all future agents. ✓
+
+**KNOWN LIMITATION:**
+- `StateManager.saveConclusion()` requires a valid integer `orgId`. Test runs with `orgId: 'test'` log a warning but complete successfully. Resolves automatically when agent runs via authenticated routes.
+
+**NEXT SESSION — Agent routes + scheduling + UI:**
+- `POST /api/agents/google-ads-monitor/run` — trigger a full agent run; stream steps via SSE
+- `GET /api/agents/google-ads-monitor/history` — return past conclusions from `agent_conclusions`
+- `AgentScheduler` registration for twice-daily automated runs
+- React UI: report view with charts and AI suggestions panel
 
 ### Chat Improvements
 
