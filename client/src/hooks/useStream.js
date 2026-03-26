@@ -17,7 +17,7 @@
  */
 
 import { useState, useRef, useCallback } from 'react';
-import useAuthStore from '../store/authStore';
+import useAuthStore from '../stores/authStore';
 
 export default function useStream(toolSlug) {
   const [streaming, setStreaming] = useState(false);

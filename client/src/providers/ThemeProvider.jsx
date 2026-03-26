@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import useSettingsStore from '../store/settingsStore';
+import useSettingsStore from '../stores/settingsStore';
 import { themes, googleFonts } from '../themes';
 
 const loadedFonts = new Set();

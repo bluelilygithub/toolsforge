@@ -1,11 +1,24 @@
-import useAuthStore from '../store/authStore';
+import useAuthStore from '../stores/authStore';
+import useToolStore from '../stores/toolStore';
+
+function handle401(response) {
+  if (response.status === 401) {
+    useAuthStore.getState().clearAuth();
+    useToolStore.getState().resetTool();
+    window.location.replace('/login');
+    return true;
+  }
+  return false;
+}
 
 const api = {
-  request(path, options = {}) {
+  async request(path, options = {}) {
     const { token } = useAuthStore.getState();
     const headers = { 'Content-Type': 'application/json', ...options.headers };
     if (token) headers['Authorization'] = `Bearer ${token}`;
-    return fetch(path, { ...options, headers });
+    const response = await fetch(path, { ...options, headers });
+    if (handle401(response)) return;
+    return response;
   },
 
   get(path, options = {}) {

@@ -252,6 +252,249 @@ async function initializeSchema() {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ
     `);
 
+    // -----------------------------------------------------------------------
+    // File ingestion pipeline — Sprint 1
+    // pgvector must be enabled before the vector column can be created.
+    // CREATE EXTENSION is idempotent with IF NOT EXISTS.
+    // -----------------------------------------------------------------------
+    await client.query(`CREATE EXTENSION IF NOT EXISTS vector`);
+
+    // document_extractions — one row per uploaded file
+    // org_id / project_id are INTEGER to match the SERIAL PKs on organizations.
+    // project_id is nullable (projects table arrives in Sprint 2).
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS document_extractions (
+        id                UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        org_id            INTEGER     NOT NULL REFERENCES organizations(id),
+        project_id        INTEGER,
+        file_name         TEXT        NOT NULL,
+        file_type         TEXT        NOT NULL,
+        file_path         TEXT        NOT NULL,
+        extracted_text    TEXT,
+        extraction_status TEXT        NOT NULL DEFAULT 'pending'
+          CHECK (extraction_status IN ('pending','complete','failed')),
+        error_message     TEXT,
+        created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_doc_extractions_org_id
+        ON document_extractions(org_id)
+    `);
+    // Composite index — Sprint 2 will build on this for scoped vector retrieval
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_doc_extractions_org_project
+        ON document_extractions(org_id, project_id)
+    `);
+
+    // document_embeddings — one row per text chunk
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS document_embeddings (
+        id             UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        extraction_id  UUID        NOT NULL REFERENCES document_extractions(id) ON DELETE CASCADE,
+        org_id         INTEGER     NOT NULL,
+        project_id     INTEGER,
+        chunk_index    INTEGER     NOT NULL,
+        chunk_text     TEXT        NOT NULL,
+        embedding      vector(768),
+        created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_doc_embeddings_extraction_id
+        ON document_embeddings(extraction_id)
+    `);
+    // Composite index — heavily used by scoped similarity search
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_doc_embeddings_org_project
+        ON document_embeddings(org_id, project_id)
+    `);
+    // Sprint 2: HNSW index replaces the Sprint 1 IVFFlat index.
+    // HNSW offers better recall at query time and does not require a training
+    // pass (no minimum row count), making it more robust at small dataset sizes.
+    // m=16 / ef_construction=64 are pgvector defaults and a safe starting point;
+    // Sprint 3 can tune ef_search at query time without rebuilding the index.
+    //
+    // pgvector HNSW does not support multi-column (scalar + vector) indices, so
+    // the B-tree composite index idx_doc_embeddings_org_project (org_id, project_id)
+    // handles pre-filtering while HNSW handles ANN distance scoring.
+    //
+    // The DO block is idempotent: it drops the old IVFFlat index if present and
+    // creates the HNSW index only when it doesn't already exist.
+    await client.query(`
+      DO $$
+      BEGIN
+        -- Remove Sprint 1 IVFFlat index if it still exists
+        IF EXISTS (
+          SELECT 1 FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relname = 'idx_doc_embeddings_vector'
+            AND n.nspname = 'public'
+        ) THEN
+          DROP INDEX idx_doc_embeddings_vector;
+        END IF;
+
+        -- Create HNSW index when it doesn't already exist
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relname = 'idx_doc_embeddings_hnsw'
+            AND n.nspname = 'public'
+        ) THEN
+          CREATE INDEX idx_doc_embeddings_hnsw
+            ON document_embeddings USING hnsw (embedding vector_cosine_ops)
+            WITH (m = 16, ef_construction = 64);
+        END IF;
+      END
+      $$
+    `);
+
+    // -----------------------------------------------------------------------
+    // Usage telemetry — Sprint 3
+    // org_id / user_id are INTEGER to match SERIAL PKs on organizations/users.
+    // The spec describes them as uuid but the existing schema uses SERIAL;
+    // using INTEGER keeps FK types consistent across the whole codebase.
+    // -----------------------------------------------------------------------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS usage_events (
+        id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        org_id           INTEGER     NOT NULL,
+        user_id          INTEGER     NOT NULL,
+        event_type       TEXT        NOT NULL,
+        file_type        TEXT,
+        chunk_count      INTEGER,
+        query_tokens     INTEGER,
+        result_count     INTEGER,
+        embedding_model  TEXT,
+        duration_ms      INTEGER,
+        created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    // B-tree composite on (org_id, created_at) — supports time-windowed admin
+    // queries with an org filter, which is the primary access pattern.
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_usage_events_org_created_at
+        ON usage_events(org_id, created_at DESC)
+    `);
+
+    // -----------------------------------------------------------------------
+    // Projects module
+    // org_id / user_id FKs are INTEGER to match SERIAL PKs on organizations/users.
+    // project_id FKs are UUID to match the projects.id PK defined here.
+    // -----------------------------------------------------------------------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS projects (
+        id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        org_id      INTEGER     NOT NULL REFERENCES organizations(id),
+        name        VARCHAR(255) NOT NULL,
+        description TEXT,
+        status      VARCHAR(50) NOT NULL DEFAULT 'active'
+          CHECK (status IN ('active','archived')),
+        created_by  INTEGER     REFERENCES users(id),
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_projects_org_id ON projects(org_id)
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS project_members (
+        id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        project_id  UUID        NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        user_id     INTEGER     NOT NULL REFERENCES users(id)    ON DELETE CASCADE,
+        org_id      INTEGER     NOT NULL,
+        role        VARCHAR(50) NOT NULL DEFAULT 'member'
+          CHECK (role IN ('owner','member','viewer')),
+        added_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (project_id, user_id)
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_project_members_project_id ON project_members(project_id)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_project_members_user_id ON project_members(user_id)
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS tasks (
+        id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        project_id  UUID        NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        org_id      INTEGER     NOT NULL,
+        title       VARCHAR(255) NOT NULL,
+        description TEXT,
+        status      VARCHAR(50) NOT NULL DEFAULT 'todo'
+          CHECK (status IN ('todo','in_progress','done')),
+        assigned_to INTEGER     REFERENCES users(id),
+        due_date    DATE,
+        created_by  INTEGER     REFERENCES users(id),
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON tasks(project_id)
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS milestones (
+        id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        project_id  UUID        NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        org_id      INTEGER     NOT NULL,
+        title       VARCHAR(255) NOT NULL,
+        description TEXT,
+        due_date    DATE,
+        status      VARCHAR(50) NOT NULL DEFAULT 'pending'
+          CHECK (status IN ('pending','reached')),
+        created_by  INTEGER     REFERENCES users(id),
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_milestones_project_id ON milestones(project_id)
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS project_pinned_files (
+        id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        project_id  UUID        NOT NULL REFERENCES projects(id)             ON DELETE CASCADE,
+        org_id      INTEGER     NOT NULL,
+        file_id     UUID        NOT NULL REFERENCES document_extractions(id) ON DELETE CASCADE,
+        pinned_by   INTEGER     REFERENCES users(id),
+        pinned_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (project_id, file_id)
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_project_pinned_files_project_id ON project_pinned_files(project_id)
+    `);
+
+    // document_embeddings — add tool_scope and resource_id for per-project RAG scoping
+    await client.query(`
+      ALTER TABLE document_embeddings
+        ADD COLUMN IF NOT EXISTS tool_scope  VARCHAR(50) NOT NULL DEFAULT 'general',
+        ADD COLUMN IF NOT EXISTS resource_id UUID
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_document_embeddings_tool_scope  ON document_embeddings(tool_scope)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_document_embeddings_resource_id ON document_embeddings(resource_id)
+    `);
+
     await client.query('COMMIT');
     logger.info('Core schema initialized');
 

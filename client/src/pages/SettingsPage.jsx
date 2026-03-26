@@ -6,8 +6,8 @@ const TZ_LIST = Intl.supportedValuesOf ? Intl.supportedValuesOf('timeZone') : [
   'Asia/Dubai','Asia/Kolkata','Asia/Singapore','Asia/Tokyo',
   'Australia/Sydney','Australia/Melbourne','Pacific/Auckland',
 ];
-import useSettingsStore from '../store/settingsStore';
-import useAuthStore from '../store/authStore';
+import useSettingsStore from '../stores/settingsStore';
+import useAuthStore from '../stores/authStore';
 import { themes, googleFonts, FONT_CATEGORIES } from '../themes';
 import { useToast } from '../components/Toast';
 import { useIcon } from '../providers/IconProvider';

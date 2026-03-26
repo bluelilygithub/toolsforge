@@ -14,6 +14,10 @@ const adminRoutes       = require('./routes/admin');
 const orgRoutes         = require('./routes/org');
 const invitationRoutes   = require('./routes/invitations');
 const userSettingsRoutes = require('./routes/userSettings');
+const filesRoutes        = require('./routes/files');
+const adminUsageRoutes   = require('./routes/adminUsage');
+const projectsRoutes     = require('./routes/projects');
+const searchRoutes       = require('./routes/search');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -64,6 +68,10 @@ app.use('/api/admin',             adminRoutes);
 app.use('/api/org',               orgRoutes);
 app.use('/api/invitations',        invitationRoutes);
 app.use('/api/user-settings',     userSettingsRoutes);
+app.use('/api/files',             filesRoutes);
+app.use('/api/admin',             adminUsageRoutes);
+app.use('/api/projects',          projectsRoutes);
+app.use('/api/search',            searchRoutes);
 
 // Static files + React Router catch-all — after all API routes so /api/* is never intercepted
 const clientDist = path.join(__dirname, 'public');

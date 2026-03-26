@@ -2,8 +2,8 @@
 
 **Built by:** Michael Barrett
 **Purpose:** Multi-user modular platform — a foundation for building shared AI tools across an organisation
-**Status:** Foundation complete — auth, roles, permission service, invitation workflow, email delivery, password reset, profile management, password history, account lockout, configurable security settings, structured logging, in-app log viewer, email template management, font/theme customisation, AI model catalogue, role-based model permissions, SSE streaming backbone, AI Chat tool, Model Advisor, admin UI
-**Stack:** Node.js/Express · PostgreSQL · Docker · Railway · React/Vite · Tailwind CSS · Anthropic Claude
+**Status:** Production-ready multi-tenant platform — auth, roles, permission service, invitation workflow, email delivery, password reset, profile management, password history, account lockout, configurable security settings, structured logging, in-app log viewer, email template management, font/theme customisation, AI model catalogue, role-based model permissions, SSE streaming backbone, AI Chat tool, Model Advisor, admin UI, server-side file ingestion pipeline (PDF/Word/Excel/text), vector embeddings with HNSW similarity search, org-scoped RAG, usage telemetry, admin usage analytics, client-side route guards (RequireAuth + RequireRole), theme-aware dashboard, tool registry with role-filtered card grid
+**Stack:** Node.js/Express · PostgreSQL 15 + pgvector · Docker · Railway · React/Vite · Tailwind CSS · Anthropic Claude · Google text-embedding-004
 
 ---
 
@@ -197,6 +197,89 @@ Response (no mismatch):
 
 **Critical:** `suggestedModels` is built exclusively from `PermissionService.getPermittedModels(userId, toolSlug)` filtered to the suggested tier. A user without `chat_premium` access can never receive Opus as a suggestion, regardless of prompt complexity. If the classifier call itself fails for any reason the endpoint returns `{ mismatch: false }` — the user is never blocked from sending.
 
+#### File Ingestion Pipeline
+
+Server-side extraction, chunking, and embedding of uploaded documents. The pipeline runs entirely on the server — no client-side processing, no third-party storage.
+
+**Supported formats:** PDF (pdf-parse), Word (mammoth), Excel/XLSX (exceljs), plain text and code files (17 extension allowlist).
+
+**Upload flow:**
+1. `POST /api/files/upload` — multer validates MIME type and extension (500 KB limit), inserts a `document_extractions` row with status `pending`, spawns a Worker Thread, returns `{ extractionId }` immediately.
+2. Worker Thread runs `extractionWorker.js` in isolation — creates its own pg Pool (Worker Threads do not share module instances with the parent process).
+3. Worker extracts text → strips 14 prompt-injection patterns (role-override strings, instruction-bypass patterns) → chunks into ~500-token segments with 50-token overlap → calls `embedBatch()` → bulk-inserts to `document_embeddings` → updates status to `completed`.
+4. `GET /api/files/:extractionId/status` — org-scoped poll endpoint; returns `{ extractionStatus, chunkCount }`.
+
+**Why Worker Threads?** Extraction is CPU-intensive (PDF parsing, canvas rasterisation). Running it on the main event loop would block all other requests for the duration. Worker Threads run in parallel with the main thread; the response to the upload caller returns before extraction begins.
+
+**Prompt-injection sanitisation:** Extracted text is scanned for patterns like `ignore previous instructions`, `you are now`, `SYSTEM:`, `</s>` and similar override tokens before chunking. A document containing these patterns is still processed — the offending text is replaced with a neutral marker rather than rejecting the upload. This prevents adversarial documents from redirecting the AI's behaviour when their chunks appear in context.
+
+#### Multi-Tenant RAG Architecture
+
+Retrieval-Augmented Generation with mandatory org-level isolation at every layer.
+
+**Embedding model:** Google `text-embedding-004` — 768-dimensional vectors, accessed via `@google/generative-ai`. Lazy client initialisation (client created on first call, not at module load).
+
+**Index:** HNSW (Hierarchical Navigable Small World) via pgvector. Parameters: m=16, ef_construction=64. Replaces IVFFlat which requires a separate `VACUUM` + `SELECT count(*)` before index construction is useful; HNSW builds incrementally as rows are inserted and delivers consistently better recall.
+
+**Search flow (`POST /api/files/search`):**
+1. `requireAuth` resolves `req.user.org_id`
+2. PermissionService confirms the caller has a role for the requested project
+3. `embedText(query)` produces a 768-dim query vector
+4. `executeSearch({ orgId, projectId, queryEmbedding, topK })` runs a parameterised SQL query — `WHERE de.org_id = $1` is the first predicate; no other tenant's embeddings can appear in results regardless of `project_id` or `topK`
+5. Results are returned without `org_id` — callers receive only chunk text, file metadata, and similarity score
+
+**Two-layer isolation guarantee:**
+- **Application layer:** PermissionService checks the caller has a project role before any DB query runs
+- **SQL layer:** `org_id = $1` is a mandatory WHERE clause on both `document_embeddings` and the `document_extractions` join — never parameterised from user input; always sourced from `req.user.org_id`
+
+Neither layer alone is sufficient: the application check can be bypassed if the route is called directly; the SQL check alone does not prevent a user from searching a project they were removed from.
+
+**`executeSearch()` is a standalone function** (not an inline route closure) so that the telemetry layer can wrap it at a single call site without touching the isolation logic.
+
+#### Governance and Observability Layer
+
+Telemetry and admin analytics built on top of the file pipeline.
+
+**TelemetryService (`server/services/telemetryService.js`):**
+- `recordEvent(orgId, userId, eventType, metadata)` — always resolves, never rejects, never throws
+- All DB logic is wrapped in try/catch; failures log at `warn` level only and are invisible to the caller
+- Called as `void recordEvent(...)` from route handlers — no `await`, no error propagation, no impact on response time
+- Supported events: `file_upload` (on accepted upload), `embedding_generated` (from worker on completion), `file_search` (on search with result count and duration)
+
+**Admin usage analytics (`GET /api/admin/usage`):**
+- Protected by `requireAuth` + `PermissionService.isOrgAdmin` — fails closed with 403
+- `org_id` is always sourced from `req.user`; never accepted as a query parameter
+- Optional filters: `from` / `to` ISO date strings (defaults: 30 days ago → now), `user_id` integer
+- Returns summary aggregates (total uploads, searches, embeddings, chunks, average search duration) and per-user breakdown
+- All queries are fully parameterised; `user_id` filter uses `AND user_id = $4` appended conditionally — no string interpolation
+
+**Rate limiting on file endpoints (keyed by `req.user.id`, not IP):**
+- Upload: 20 requests per hour — prevents bulk upload abuse per user, not per network
+- Search: 60 requests per 10 minutes — prevents embedding API cost abuse
+- Limiters are placed after `requireAuth` in the middleware chain so `req.user.id` is available as the key
+- IP-keyed limiting is inappropriate here because org users share infrastructure; a single user abusing uploads should not affect their colleagues
+
+#### Security Test Suite
+
+`server/tests/ragIsolation.test.js` — five security contract tests using the Node built-in `node:test` runner. No live database required: `require.cache` is injected with stub modules before any route module loads.
+
+**What is tested and why:**
+
+| Test | Contract |
+|---|---|
+| SQL org isolation | Search SQL `$1` is always `req.user.org_id`; `org_id`/`orgId` absent from response payload |
+| Cross-org status 404 | Status query includes both `extraction_id` and `org_id` params; a valid extraction from another org returns 404, not 200 |
+| Cross-org project 403 | A project belonging to another org returns 403 before any search executes; `results` absent from body |
+| Telemetry resilience | `recordEvent` resolves under 4 bad-input scenarios: DB throws, null args, undefined args, zero/empty values |
+| Admin gate 403 | A non-admin authenticated user receives 403 from the usage endpoint; `summary` and `byUser` absent from body |
+
+**Why these five?** Each test targets a failure mode that cannot be caught by unit tests on individual functions — they require the full middleware chain, the route handler, and the DB query to run together through the stub. The SQL isolation test specifically asserts that the `org_id` value passed into the query is the value from `req.user`, not from any query parameter or request body — a class of bug that static analysis cannot catch.
+
+**Run:**
+```bash
+node --test server/tests/ragIsolation.test.js
+```
+
 #### Tool Model Access Policy
 Each tool defines its model access policy in `tools.config.roleModelAccess` — a map of role name to tier. `PermissionService.getPermittedModels` reads this at request time; org_admin always receives all models regardless.
 
@@ -277,6 +360,11 @@ Each tool's `config.roles` array defines the roles an admin can grant to users f
 | `/api/admin/app-settings` | PUT | org_admin | Update organisation-wide app settings |
 | `/api/invitations/:token` | GET | No | Validate invitation token |
 | `/api/invitations/accept` | POST | No | Accept invitation, set password, return session |
+| `/api/files/upload` | POST | Yes (rate limited: 20/hr) | Upload file for extraction and embedding — PDF, Word, Excel, plain text; 500 KB limit |
+| `/api/files/:extractionId/status` | GET | Yes | Extraction status and chunk count for an uploaded file |
+| `/api/files/:fileId` | GET | Yes | Download a file — org-scoped ownership check |
+| `/api/files/search` | POST | Yes (rate limited: 60/10 min) | Semantic similarity search across org/project embeddings — returns ranked chunks with source metadata |
+| `/api/admin/usage` | GET | org_admin | Org-scoped usage analytics — uploads, searches, embeddings, per-user breakdown, configurable date window |
 
 ---
 
@@ -300,6 +388,9 @@ Each tool's `config.roles` array defines the roles an admin can grant to users f
 | `usage_logs` | One row per AI response — model, tokens, cost, user, tool |
 | `app_logs` | Server log entries (info, warn, error) written by Winston DB transport |
 | `email_templates` | Admin-editable email templates — slug, subject, body_html, body_text, variables array, tool_slug |
+| `document_extractions` | One row per uploaded file — UUID PK, org_id, project_id, file path, MIME type, extraction status (`pending` / `processing` / `completed` / `failed`), chunk count |
+| `document_embeddings` | One row per text chunk — UUID PK, extraction_id FK, org_id, project_id, chunk text, `vector(768)` embedding, chunk index, metadata JSONB |
+| `usage_events` | One row per telemetry event — UUID PK, org_id, user_id, event_type (`file_upload` / `embedding_generated` / `file_search`), file_type, chunk_count, query_tokens, result_count, embedding_model, duration_ms |
 
 #### Key Design Decisions
 - `users.password_hash` is nullable — invited users have no password until they activate
@@ -310,6 +401,9 @@ Each tool's `config.roles` array defines the roles an admin can grant to users f
 - `app_logs` stores `info`, `warn`, `error` — `http` request logs are console-only to avoid table bloat
 - `system_settings` holds both operational config (spend thresholds) and the live AI model catalogue
 - `tools.config` JSONB stores both the model access policy (`roleModelAccess`) and the list of grantable roles (`roles`) — a new tool is self-describing with no admin UI code changes needed
+- `document_extractions` and `document_embeddings` use UUID PKs; `org_id`/`project_id`/`user_id` are INTEGER FKs matching the SERIAL PKs on existing tables
+- `document_embeddings.embedding` is `vector(768)` — matches Google `text-embedding-004` output dimensionality; indexed with HNSW (m=16, ef_construction=64) for approximate nearest-neighbour search
+- `usage_events` records are append-only — no updates; admin analytics queries are always date-range bounded via `idx_usage_events_org_created_at`
 
 ---
 
@@ -318,7 +412,6 @@ Each tool's `config.roles` array defines the roles an admin can grant to users f
 Located in `client/`.
 
 #### Design System
-Ported from Curam Vault — same patterns, rebranded for ToolsForge:
 - CSS custom properties for theming (`--color-bg`, `--color-surface`, `--color-border`, `--color-primary`, `--color-text`, `--color-muted`)
 - 5 themes: Warm Sand (default), Dark Slate, Forest, Midnight Blue, Paper White
 - Separate body font and heading font pickers — 16 Google Fonts across sans-serif, serif, and monospace categories
@@ -344,6 +437,10 @@ Ported from Curam Vault — same patterns, rebranded for ToolsForge:
 | Admin — App Settings | `/admin/app-settings` | org_admin only |
 | Date & Time tool | `/tools/datetime` | datetime role or org_admin |
 | AI Chat tool | `/tools/chat` | org_member or org_admin |
+| Model Advisor | `/tools/advisor` | org_member or org_admin |
+| Projects | `/tools/projects` | org_member or org_admin |
+| Google Ads | `/tools/ads` | org_admin only |
+| Video Studio | `/tools/video` | org_admin only |
 
 **Login** — Vault-style card layout. ToolsForge brand mark. Email/password with show/hide toggle. "Forgot password?" link below sign-in button.
 
@@ -353,7 +450,7 @@ Ported from Curam Vault — same patterns, rebranded for ToolsForge:
 
 **Accept Invitation** — Validates token on load. Shows set-password form. On activation, logs user in immediately and redirects to dashboard. Shows clear error for invalid/expired tokens.
 
-**Dashboard** — Displays org name and signed-in user. Tool cards from registry. Enabled tool cards link to their route. Empty state placeholder when no tools installed. Admin badge shown for org_admin users.
+**Dashboard** — Greeting, org name, and signed-in user. Tool cards rendered from the tool registry (`config/tools.js`) — only permitted tools shown based on the user's role. Cards use theme CSS variables (`--color-surface`, `--color-border`, `--color-primary`, `--color-text`, `--color-muted`) and heading/body font variables so they respond to the active theme and font selections. Icons are Lucide icons (via `IconProvider`) coloured with `--color-primary`, not emojis. "Open →" button uses `--color-primary` background. "Last used: …" shortcut shown below the grid.
 
 **Settings — Profile tab** — Email (read-only). First name + last name (side by side) + phone. Change password section with current/new/confirm fields and show/hide toggles. Password reuse of last 5 is blocked server-side.
 
@@ -386,7 +483,7 @@ Every send passes through the **Model Advisor** before the stream opens — see 
 
 #### Model Advisor
 
-A pre-send classifier that intercepts every chat submission and suggests a better-matched model if the current selection is a poor fit for the task. Ported and adapted from Curam Vault.
+A pre-send classifier that intercepts every chat submission and suggests a better-matched model if the current selection is a poor fit for the task.
 
 **Flow:**
 1. User presses Enter or the send button → `checkModelBeforeSend()` fires
@@ -424,16 +521,20 @@ This combination — hard server-side enforcement on the stream endpoint, soft c
 #### Component Structure
 ```
 client/src/
-  App.jsx                      # Router, providers, future flags
+  App.jsx                      # Router, providers, future flags; wraps /tools/ads + /tools/video in RequireRole
   main.jsx
   index.css                    # Tailwind + CSS variables + scrollbar
   themes.js                    # 5 theme definitions + 16 Google Fonts
+  config/
+    tools.js                   # TOOLS array — id, name, path, lucideIcon, description, requiredPermission
+                               # getPermittedTools(userRole) filters by role
   providers/
     ThemeProvider.jsx          # Loads Google Fonts + injects CSS vars on change
-    IconProvider.jsx           # Semantic icon map (Lucide)
-  store/
-    authStore.js               # token, user (incl. profile fields) — persisted
-    settingsStore.js           # theme, bodyFont, headingFont — persisted
+    IconProvider.jsx           # Semantic icon map (Lucide) — all tool lucideIcon values registered here
+  stores/
+    authStore.js               # token, user (incl. profile fields) — persisted; default export
+    settingsStore.js           # theme, bodyFont, headingFont — persisted; default export
+    toolStore.js               # lastVisitedTool, sidebarCollapsed — persisted; default export
   hooks/
     useStream.js               # Generic SSE streaming hook for AI tools
     useSpeechInput.js          # Headless voice dictation (Web Speech API)
@@ -441,12 +542,15 @@ client/src/
     useClipboardMedia.js       # Clipboard image paste with canvas resize
     useFileAttachment.js       # File picker — images + text, admin-configured types
   utils/
-    apiClient.js               # Fetch wrapper — auto-attaches Bearer token
+    apiClient.js               # Fetch wrapper — auto-attaches Bearer token; intercepts 401 → clears auth + redirects /login
     stripForSpeech.js          # Strips markdown/code/URLs before TTS — importable by any tool
   components/
-    AuthGuard.jsx              # Validates token on mount, redirects to /login
-    Layout.jsx                 # Top bar + collapsible sidebar + Outlet
-    Sidebar.jsx                # Nav: Home, Tools section, Admin section (org_admin), Settings
+    RequireAuth.jsx            # Route guard — checks token presence; redirects to /login if missing
+    RequireRole.jsx            # Route guard — checks user.role against allowedRoles prop; redirects to / if not authorised
+    AppShell.jsx               # Fixed desktop sidebar + mobile drawer + TopNav + Outlet
+    TopNav.jsx                 # Top bar — brand, global search, user menu
+    GlobalSearchBar.jsx        # Command-palette style search across tools and pages
+    Sidebar.jsx                # Nav links: Home, Tools section, Admin section (org_admin), Settings
     Toast.jsx                  # Toast context + floating notifications
     ModelAdvisorModal.jsx      # Pre-send model suggestion modal — Switch & Send / Keep & Send
     VoiceInputButton.jsx       # Stateless UI primitive — mic idle / red pulsing dot + Stop when active
@@ -456,7 +560,7 @@ client/src/
     ForgotPasswordPage.jsx
     ResetPasswordPage.jsx
     AcceptInvitePage.jsx
-    DashboardPage.jsx
+    DashboardPage.jsx          # Theme-aware tool cards (CSS vars); Lucide icons via IconProvider; role-filtered via getPermittedTools
     SettingsPage.jsx           # Profile tab includes user timezone override
     AdminUsersPage.jsx
     AdminAIModelsPage.jsx
@@ -487,6 +591,11 @@ server/
     emailTemplates.js          # EmailTemplateService — DB-backed template CRUD + {{variable}} render
     costCalculator.js          # Async cost calculator — reads pricing from DB model catalogue
     usageLogger.js             # logUsage + checkSpendThresholds + logAndCheck
+    chunkingService.js         # chunkText(text, targetTokens, overlapTokens) — ~500 token chunks, 50 token overlap
+    embeddingService.js        # embedText / embedBatch — Google text-embedding-004 (768-dim), lazy client init
+    telemetryService.js        # recordEvent(orgId, userId, eventType, metadata) — fire-and-forget, never throws
+  workers/
+    extractionWorker.js        # Worker Thread — pdf-parse / mammoth / exceljs / plain text; sanitises prompt-injection; bulk-inserts embeddings
   utils/
     logger.js                  # Winston logger — console + DB transport (info/warn/error to app_logs)
     emailDefaults.js           # Hardcoded default template content — seeding source + fallback
@@ -498,8 +607,12 @@ server/
     stream.js                  # SSE streaming + permitted-models + analyse-prompt for all AI tools
     org.js                     # GET /api/org
     admin.js                   # users, invite, roles, tool-roles, ai-models, test-model, security-settings, logs, email-templates, app-settings
+    adminUsage.js              # GET /api/admin/usage — org-scoped telemetry analytics (admin only)
     userSettings.js            # GET/POST /api/user-settings — per-user key/value JSONB store
     invitations.js             # GET /api/invitations/:token, POST /api/invitations/accept
+    files.js                   # upload, status, download, search — rate-limited; org isolation enforced at SQL layer
+  tests/
+    ragIsolation.test.js       # node:test security contract suite — org isolation, cross-org 403/404, telemetry resilience, admin gate
 ```
 
 ---
@@ -808,9 +921,10 @@ The **Grant Access** dropdown in Admin → Users will automatically include the 
 - Node.js v22
 
 ### Environment Variables
-Add `ANTHROPIC_API_KEY` to your `.env` file to enable AI tools:
+Add `ANTHROPIC_API_KEY` and `GOOGLE_GENERATIVE_AI_API_KEY` to your `.env` file to enable AI tools and file embedding:
 ```bash
 ANTHROPIC_API_KEY=sk-ant-...
+GOOGLE_GENERATIVE_AI_API_KEY=AIza...
 ```
 
 ### Start Database
@@ -856,6 +970,7 @@ APP_URL=http://localhost:5173
 SEED_ADMIN_EMAIL=your@email.com
 SEED_ADMIN_PASSWORD=your-password
 ANTHROPIC_API_KEY=sk-ant-...
+GOOGLE_GENERATIVE_AI_API_KEY=AIza...   # Required for file embedding (text-embedding-004)
 
 # Email — MailChannels HTTP API (primary)
 MAIL_CHANNEL_API_KEY=your-mailchannels-api-key
@@ -901,6 +1016,16 @@ docker exec -it toolsforge-db psql -U postgres -d platform_dev -c "SELECT value 
 **View AI usage logs:**
 ```powershell
 docker exec -it toolsforge-db psql -U postgres -d platform_dev -c "SELECT user_id, tool_slug, model_id, input_tokens, output_tokens, cost_usd, created_at FROM usage_logs ORDER BY created_at DESC LIMIT 20;"
+```
+
+**View document extraction status:**
+```powershell
+docker exec -it toolsforge-db psql -U postgres -d platform_dev -c "SELECT id, file_name, extraction_status, chunk_count, created_at FROM document_extractions ORDER BY created_at DESC LIMIT 20;"
+```
+
+**View usage telemetry:**
+```powershell
+docker exec -it toolsforge-db psql -U postgres -d platform_dev -c "SELECT event_type, count(*), avg(duration_ms) FROM usage_events GROUP BY event_type;"
 ```
 
 **View pending invitations:**
@@ -1010,7 +1135,7 @@ if (fs.existsSync(clientDist)) {
 
 #### 6. SSE over POST — use fetch, not EventSource
 
-The native browser `EventSource` API only supports GET requests. AI tool streaming uses `POST` to send the messages payload. The `useStream` hook reads the response body as a `ReadableStream` via the `fetch` API, parsing `data: {...}\n\n` lines manually. This is the same pattern used in Curam Vault.
+The native browser `EventSource` API only supports GET requests. AI tool streaming uses `POST` to send the messages payload. The `useStream` hook reads the response body as a `ReadableStream` via the `fetch` API, parsing `data: {...}\n\n` lines manually. This is required because `EventSource` only supports GET.
 
 #### 7. AI model catalogue — DB-backed with static fallback
 
@@ -1069,11 +1194,32 @@ Values are clamped server-side on `PUT /api/admin/security-settings` (attempts: 
 | `SEED_ADMIN_EMAIL` | Admin account email |
 | `SEED_ADMIN_PASSWORD` | Admin account password |
 | `ANTHROPIC_API_KEY` | Anthropic API key — required for all AI tools |
+| `GOOGLE_GENERATIVE_AI_API_KEY` | Google AI API key — required for file embedding (`text-embedding-004`) |
 | `MAIL_CHANNEL_API_KEY` | MailChannels API key (`X-Api-Key` header) |
 | `MAIL_FROM_EMAIL` | From address for all outbound email |
 | `MAIL_FROM_NAME` | From name for all outbound email |
 
 `APP_URL` is used to build invitation and password reset links in emails. It is no longer required for CORS to function correctly.
+
+#### 12. File ingestion in Worker Threads — event loop protection
+
+PDF parsing (pdf-parse) and spreadsheet traversal (exceljs) are synchronous and CPU-bound. Running them on the main event loop would stall all in-flight requests for the duration of extraction. Worker Threads run in parallel with the main process, sharing no memory by default. Each worker creates its own pg Pool — module instances (including the parent's pool) are not accessible across thread boundaries. The upload route returns `{ extractionId }` immediately; the caller polls `GET /api/files/:extractionId/status` to observe progress.
+
+#### 13. HNSW over IVFFlat for vector indexing
+
+IVFFlat requires pre-computed centroids (`vacuum + count`) before the index is effective. In a multi-tenant schema where rows arrive continuously from multiple orgs, the index would be stale until manually rebuilt. HNSW builds incrementally — every inserted row is immediately indexed with no rebuild step — and delivers consistently better recall at equivalent query time. The migration from IVFFlat to HNSW is handled idempotently in `db.js`: the old index is dropped if present, the new one created, inside a DO block that runs on every server start.
+
+#### 14. org_id enforcement at the SQL layer — not just the application layer
+
+The `executeSearch` function's first WHERE clause is `WHERE de.org_id = $1`. This is not a defence-in-depth afterthought — it is the primary isolation boundary. The application-layer PermissionService check guards against a user accessing a project they have no role on, but it cannot prevent a bug in the route handler from passing the wrong `orgId`. Having `org_id = $1` as a mandatory SQL predicate, sourced unconditionally from `req.user.org_id`, means a compromised or buggy route handler cannot leak another org's data — the DB enforces the boundary independently.
+
+#### 15. Telemetry as fire-and-forget
+
+Usage events must never affect response latency or reliability. `telemetryService.recordEvent` is designed to be called without `await` (`void recordEvent(...)`) and is guaranteed to always resolve — all DB logic is try/catch'd internally, failures log at `warn` only. This is a different pattern from `usageLogger.logAndCheck` (which is awaited because spend threshold warnings must appear before the response returns). The distinction is intentional: spend thresholds are operational, telemetry is analytical. Analytical writes should never block user-facing operations.
+
+#### 16. Rate limiting keyed by user ID, not IP, for file endpoints
+
+Org users share infrastructure: they may be on the same corporate IP, the same VPN exit node, or the same NAT gateway. IP-keyed rate limiting on file endpoints would mean one user's heavy upload session blocks their entire office. User-ID-keyed limiting isolates the constraint to the individual — a user who uploads 20 files in an hour hits their own limit without affecting colleagues. This requires `requireAuth` to run before the rate limiter in the middleware chain, which is why the file-route limiters are applied per-route rather than globally.
 
 #### 9. Logging — Morgan + Winston with DB transport
 
@@ -1102,7 +1248,7 @@ Prevents host `node_modules` from polluting the Docker build context. Without th
 
 ## Chat Module — Feature Backlog
 
-The current AI Chat tool is a functional foundation: streaming responses, permitted model picker, Model Advisor, usage tracking. What it lacks are the interaction features that make a chat interface genuinely useful day-to-day. These were all present in Curam Vault as a single-user application. The challenge for ToolsForge is not rebuilding them — it's extracting them into composable, reusable units that any future tool module can consume, not just chat.
+The current AI Chat tool is a functional foundation: streaming responses, permitted model picker, Model Advisor, usage tracking. What it lacks are the interaction features that make a chat interface genuinely useful day-to-day. The goal is to build each one as a composable, reusable unit that any future tool module can consume — not features that belong to chat specifically.
 
 ### The Three-Layer Modularity Pattern
 
@@ -1124,7 +1270,7 @@ This pattern is the discipline that makes ToolsForge a toolkit rather than a mon
 ### Feature Backlog
 
 #### Voice I/O (mic / speaker)
-Curam Vault had a `useVoice` hook using the Web Speech API — browser-native, no backend required for basic speech-to-text. Text-to-speech output (reading responses aloud) used the same API in reverse.
+Browser-native speech I/O via the Web Speech API — no backend required. Speech-to-text for dictation, text-to-speech for reading responses aloud.
 
 **Modular design:** `useVoice` lives in `client/src/hooks/` — shared, not chat-specific. Exposes `startListening()`, `stopListening()`, `transcript`, `isListening`, `speak(text)`, `isSpeaking`. A `<VoiceButton />` primitive in `client/src/components/` wraps it. Chat wires `transcript` into the message input on silence detection. Any other module that wants dictation imports the same hook.
 
@@ -1152,7 +1298,7 @@ A UI toggle on long AI responses — truncate rendered content beyond a threshol
 ---
 
 #### Current Date Injection
-Without a date in the system prompt, the model has no reliable knowledge of "today" and will either guess, hallucinate, or refuse to answer date-relative questions. Curam Vault injected the current date and user timezone into every system prompt.
+Without a date in the system prompt, the model has no reliable knowledge of "today" and will either guess, hallucinate, or refuse to answer date-relative questions.
 
 **Modular design:** A utility function `getSystemDateContext()` in `client/src/utils/` that returns a string like `"Today is Wednesday, 26 March 2026. User timezone: Australia/Brisbane (AEST, UTC+10)."` Any module that assembles a system prompt calls it. This is a one-line addition but has meaningful impact on response quality for any time-sensitive task. The server-side equivalent already logs timezone in the stream endpoint — the client-side utility closes the loop.
 
@@ -1166,14 +1312,14 @@ Export a conversation (or any structured content) as a downloadable `.md` file. 
 ---
 
 #### Follow-Up Questions
-After each AI response, generate 2–3 contextual follow-up questions the user might want to ask next. In Curam Vault this was implemented as contextual prompt chips rendered below the response. The generation was either appended to the main stream request as a structured output instruction, or fired as a separate lightweight follow-up call.
+After each AI response, generate 2–3 contextual follow-up questions the user might want to ask next — rendered as clickable prompt chips below the response. Generation is either appended to the main stream request as a structured output instruction or fired as a separate lightweight follow-up call.
 
 **Modular design:** A utility `appendFollowUpRequest(systemPrompt)` that appends a structured instruction asking the model to return follow-up suggestions as a JSON array at the end of its response. The `useStream` hook (or the stream endpoint) parses and strips the structured section before rendering the response body, emitting a `followUps` event alongside the normal `text` events. A `<FollowUpChips />` primitive renders the suggestions as clickable pills. Chat wires chip clicks into the message input. Any AI-powered module that wants to guide the user's next action can use the same pattern.
 
 ---
 
 #### URL Attachment
-Fetch a URL's content and inject it into the conversation as context. Curam Vault had SSRF-guarded server-side fetching, YouTube transcript extraction via InnerTube, and Haiku-powered summarisation of long page content before injection.
+Fetch a URL's content and inject it into the conversation as context. Requires SSRF-guarded server-side fetching and Haiku-powered summarisation of long page content before injection.
 
 **Modular design:** A server endpoint `POST /api/tools/:toolSlug/fetch-url` handles the fetch and summarisation — tool-scoped so usage is logged against the right tool. The SSRF guard (block private IP ranges, localhost, cloud metadata endpoints) lives in a shared middleware. A `useUrlAttachment` hook manages the loading and result state client-side. A `<UrlBar />` primitive renders the input and status. Chat wires the returned summary into the message context. A research tool module could use the same endpoint to build a reading list.
 

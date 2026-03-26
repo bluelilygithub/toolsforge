@@ -1,6 +1,6 @@
 import { Link, useLocation } from 'react-router-dom';
 import { useIcon } from '../providers/IconProvider';
-import useAuthStore from '../store/authStore';
+import useAuthStore from '../stores/authStore';
 
 function NavItem({ to, icon, label, active }) {
   const getIcon = useIcon();

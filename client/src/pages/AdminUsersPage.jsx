@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { useIcon } from '../providers/IconProvider';
 import { useToast } from '../components/Toast';
 import api from '../utils/apiClient';
-import useAuthStore from '../store/authStore';
+import useAuthStore from '../stores/authStore';
 
 const ORG_ROLES = ['org_member', 'org_admin'];
 

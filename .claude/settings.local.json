@@ -4,7 +4,22 @@
       "Bash(npm install:*)",
       "Bash(npm audit:*)",
       "Bash(npm uninstall:*)",
-      "Bash(grep -rl \"ai_models\\\\|vault_models\\\\|AI Models\\\\|aiModels\" 'C:\\\\Users\\\\micha\\\\Local Sites\\\\curam-protocol\\\\vault' --include=*.js --include=*.jsx)"
+      "Bash(grep -rl \"ai_models\\\\|vault_models\\\\|AI Models\\\\|aiModels\" 'C:\\\\Users\\\\micha\\\\Local Sites\\\\curam-protocol\\\\vault' --include=*.js --include=*.jsx)",
+      "Bash(node -e \":*)",
+      "Bash(node --check workers/extractionWorker.js)",
+      "Bash(node --test tests/ragIsolation.test.js)",
+      "Bash(node --check routes/files.js)",
+      "Bash(node --check db.js)",
+      "Bash(node -e \"require\\(''./routes/files''\\); console.log\\(''files route loads ok''\\)\")",
+      "Bash(node --check routes/adminUsage.js)",
+      "Bash(node --check services/telemetryService.js)",
+      "Bash(node -e \"require\\(''./routes/files''\\); require\\(''./routes/adminUsage''\\); require\\(''./services/telemetryService''\\); console.log\\(''all modules load ok''\\)\")",
+      "Bash(node --test tests/projects.test.js)",
+      "Bash(node --test tests/search.test.js)",
+      "Bash(node:*)",
+      "Bash(git:*)",
+      "Bash(sed -i \"s|from ''../store/authStore''|from ''../stores/authStore''|g\" \"C:/Users/micha/Local Sites/toolsforge/client/src/hooks/useStream.js\")",
+      "Bash(sed -i \"s|from ''../store/settingsStore''|from ''../stores/settingsStore''|g\" \"C:/Users/micha/Local Sites/toolsforge/client/src/providers/ThemeProvider.jsx\")"
     ]
   }
 }

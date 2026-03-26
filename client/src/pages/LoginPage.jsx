@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
-import useAuthStore from '../store/authStore';
+import useAuthStore from '../stores/authStore';
 import { useIcon } from '../providers/IconProvider';
 
 function LoginPage() {
@@ -26,7 +26,11 @@ function LoginPage() {
       });
       const data = await res.json();
       if (!res.ok) { setError(data.error || 'Login failed'); return; }
-      setAuth(data.token, data.user);
+      const user = {
+        ...data.user,
+        role: data.user.roles?.some(r => r.name === 'org_admin') ? 'org_admin' : 'org_member',
+      };
+      setAuth(data.token, user);
       navigate('/', { replace: true });
     } catch {
       setError('Network error — please try again');
