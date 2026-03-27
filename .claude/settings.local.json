@@ -32,7 +32,9 @@
       "Bash(taskkill /F /IM node.exe)",
       "Bash(cmd /c \"taskkill /F /IM node.exe\" 2>&1)",
       "Bash(cmd /c \"tasklist | findstr node.exe\" 2>&1)",
-      "Bash(cmd /c \"netstat -ano | findstr :3001\" 2>&1)"
+      "Bash(cmd /c \"netstat -ano | findstr :3001\" 2>&1)",
+      "Bash(node -e \"require\\(''./server/services/AgentConfigService''\\)\")",
+      "Bash(node -e \"console.log\\(require\\(''./node_modules/googleapis/package.json''\\).version\\)\")"
     ]
   }
 }
