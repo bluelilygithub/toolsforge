@@ -847,3 +847,305 @@ Key tables for understanding the architecture:
 | `accounts` + `transactions` | Double-entry bookkeeping — supports invoices, expenses, BAS |
 
 The schema evolution is visible in the migration section of `db.js`: columns added post-launch appear as `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` blocks, which makes the original design vs. later additions easy to read.
+
+---
+
+## ToolsForge — Agent Platform Learnings
+
+Patterns established while building the Google Ads Monitor agent (v0.2.0). These apply to every future agent on the platform.
+
+---
+
+### The Registration Contract
+
+`createAgentRoute({ slug, runFn, requiredPermission })` is the complete registration contract for any agent. The factory owns all the plumbing — auth middleware, SSE header setup, progress/result/error event emission, `[DONE]` on both success and error paths, and history persistence to `agent_runs`. Agent authors write none of that. A new agent only needs `tools.js`, `prompt.js`, `index.js`, and a four-line route file that calls `createAgentRoute`.
+
+The `requiredPermission` string is treated as a role name. `org_admin` always satisfies the check; the specific permission role is additive. This means access is granted at registration time, not hardcoded in platform code.
+
+---
+
+### The Single Write Path
+
+`persistRun` must be the only code that writes to `agent_runs`. Both the SSE route and `AgentScheduler` call it — never write to `agent_runs` directly from agent code. This is what makes history consistent regardless of trigger source (HTTP, cron, or any future trigger type). The function is exported from `createAgentRoute.js` for exactly this reason; it is not a private implementation detail.
+
+---
+
+### extractToolData — Generic JSONB Storage from the Trace
+
+`extractToolData(trace)` walks the AgentOrchestrator trace steps and keys each tool result by tool name:
+
+```js
+{
+  "get_campaign_performance": [...],
+  "get_search_terms": [...],
+  "get_daily_performance": [...]
+}
+```
+
+This is generic — it knows nothing about which agent ran. The UI then reads `run.data.get_campaign_performance` directly. The convention is: **tool names are the keys**. This means tool naming matters — tool names should be stable, lowercase, underscore-separated identifiers that are also usable as object keys. Do not rename a tool after the UI is reading from its key.
+
+---
+
+### extractSuggestions — Prompt-Format Dependent
+
+`extractSuggestions(text)` parses the `### Recommendations` numbered list from the agent's final response text. It assigns priority by position: items 1–2 are `high`, 3–5 are `medium`, 6+ are `low`. This works because `prompt.js` enforces that exact output structure.
+
+**Future agent prompts should follow the same `### Recommendations` numbered list convention** if they want priority-ordered suggestions parsed automatically. The format dependency is intentional — it keeps the parser simple and puts the structure contract in the prompt where it belongs.
+
+Do not change the `### Recommendations` section of any agent prompt without updating `extractSuggestions`. Do not change `extractSuggestions` without auditing every prompt that relies on it.
+
+---
+
+### Cron Expressions, Not Named Schedules
+
+`AgentScheduler.register` takes a raw cron expression. This keeps the platform generic and avoids building a named-schedule layer that would need its own maintenance. The Google Ads Monitor runs `'0 6,18 * * *'` — 6am and 6pm UTC, which is **4pm and 4am AEST (UTC+10)**. Always document the UTC↔local offset in a comment at the registration site; it is not obvious at a glance and easy to misconfigure.
+
+---
+
+### agent_runs Is the Only History Table
+
+There are no agent-specific history tables. `agent_runs.slug` is the discriminator. Adding a new agent requires zero schema changes — the `agent_runs` table accepts any slug. The composite index on `(org_id, slug, run_at DESC)` makes per-agent history queries efficient regardless of how many agents are writing to the same table.
+
+The existing `agent_executions` table (written by `services/AgentScheduler.js`) is a lower-level execution log used by the full-featured scheduler. `agent_runs` is the structured, UI-facing record. Both exist; they serve different purposes.
+
+---
+
+### The Recharts Lesson
+
+The spec said "Recharts is already available." It wasn't. The wrong response was to silently replace it with a bespoke SVG implementation buried in an agent-specific folder — that produced a non-reusable one-off that violated the platform-first principle.
+
+The right response: surface the missing dependency to the user and wait for direction. Then, if a zero-dependency fallback is genuinely needed, place it at `client/src/components/charts/` as a platform primitive with generic props.
+
+Resolution: `npm install recharts` in `client/`; `PerformanceChart.jsx` reverted to Recharts; the SVG implementation promoted to `client/src/components/charts/LineChart.jsx` with a generic prop interface (`data`, `xKey`, `leftKey`, `rightKey`, `leftFormat`, `rightFormat`) so any future agent can use it without modification.
+
+**General rule:** when an assumed dependency is missing, stop and ask. Do not silently create workarounds that encode agent-specific behaviour in platform-level locations — or worse, create agent-specific implementations of what should be platform primitives.
+
+---
+
+### SSE Pattern — Never Deviate
+
+The SSE implementation in `createAgentRoute.js` matches `server/routes/stream.js` exactly:
+
+```js
+res.setHeader('Content-Type', 'text/event-stream');
+res.setHeader('Cache-Control', 'no-cache');
+res.setHeader('Connection', 'keep-alive');
+res.setHeader('X-Accel-Buffering', 'no');   // disables nginx buffering
+res.flushHeaders();
+// ...
+res.write(`data: ${payload}\n\n`);
+// ...
+sendEvent(res, '[DONE]');   // always, on both success AND error paths
+res.end();
+```
+
+The client-side consumer in `GoogleAdsMonitorPage.jsx` matches `useStream.js` exactly:
+
+```js
+buf += decoder.decode(value, { stream: true });
+const parts = buf.split('\n\n');
+buf = parts.pop();   // last element may be incomplete
+```
+
+These patterns must not diverge across the codebase. If a new streaming pattern is needed, update `createAgentRoute.js` and `useStream.js` together, then verify both ends match before shipping.
+
+---
+
+### MarkdownRenderer — Platform Primitive for LLM Output
+
+Agent responses are markdown. `<pre>` and `whitespace-pre-wrap` do not render it — they show raw `###` and `**` characters to the user.
+
+`client/src/components/MarkdownRenderer.jsx` is the single rendering component for all LLM text output on the platform. It is zero-dependency (line-by-line parser, no `marked`/`react-markdown`), uses CSS vars throughout, and handles the full subset Claude produces: `#`/`##`/`###` headings, `**bold**`, bullet lists, ordered lists, `---` rules, and paragraphs.
+
+**The convention is absolute:** any component that displays LLM-generated text uses `MarkdownRenderer`. Agent authors do not write their own renderers. Improvements (code blocks, tables, links) are made once in `MarkdownRenderer` and propagate everywhere.
+
+This applies to future agents immediately. It also applies to `ChatPage` — which currently uses `whitespace-pre-wrap` and is therefore not rendering markdown — but that is a separate change.
+
+---
+
+### Long-Running Agent UX — Indeterminate Progress + Elapsed Timer
+
+Agent runs (ReAct loop + API calls) take 1–3 minutes. A single static text label is not enough feedback — the user cannot tell if the process is alive.
+
+`RunningIndicator` in `GoogleAdsMonitorPage.jsx` provides two signals:
+1. **Indeterminate sweep bar** — a `var(--color-primary)` bar slides continuously across a 4px track using a CSS keyframe (`@keyframes tf-ads-slide`). This confirms the process is running without implying false granular progress.
+2. **Elapsed timer** — a `setInterval` counter in the corner updates every second (`5s`, `1m 3s`). Users calibrate their expectations; on subsequent runs they know roughly how long to wait.
+
+The CSS keyframe is injected via a `<style>` tag in the component (scoped name `tf-ads-slide` avoids collisions). The timer resets each time the component mounts, which happens naturally when `running` toggles.
+
+**Pattern for future agents:** any agent run that takes more than a few seconds should use the same two signals. Copy `RunningIndicator` or extract it to `client/src/components/` if more than one agent needs it.
+
+---
+
+### Auth Store Shape — `user.roles`, Not `user.role`
+
+The login API returns `roles: [{ name, scope_type, scope_id }]` — **an array, not a string**. The property `user.role` does not exist; it is always `undefined`.
+
+Three places got this wrong at the same time:
+1. `RequireRole.jsx` — was checking `user?.role`
+2. `AppShell.jsx` `isAdmin` — was checking `primaryRole === 'org_admin'` from `user?.role`
+3. `AppShell.jsx` `getPermittedTools` — was passing `user?.role` (always null)
+
+**Correct pattern everywhere:**
+```js
+// Resolve the global role from the roles array
+const primaryRole = user?.roles?.find(r => r.scope_type === 'global')?.name ?? null;
+
+// Check for a specific role
+const hasRole = allowedRoles.some(r => user?.roles?.some(ur => ur.name === r));
+```
+
+**Why this matters:** All role-based guards and tool permission filtering silently fail (every check returns falsy) when this is wrong. Routes appear accessible, tools disappear from the sidebar, and `RequireRole` redirects every user to `/` regardless of their actual role. The failure is silent — no errors, no warnings.
+
+**Reference:** `client/src/stores/authStore.js` — `user` is the raw login response. Check the actual shape there before writing any new role check.
+
+---
+
+### MarkdownRenderer — Infinite Loop Guard + Table Support
+
+#### Infinite loop guard
+
+The `parseBlocks()` function uses a `while (i < lines.length)` outer loop with branching for each block type. The paragraph branch used to be:
+
+```js
+} else {
+  const paraLines = [];
+  while (i < lines.length && !lines[i].trim().startsWith('#') && ...) {
+    paraLines.push(lines[i++]);
+  }
+  blocks.push({ type: 'paragraph', ... });
+}
+```
+
+**Bug:** A line like `#hashtag` (starts with `#`, no space) matches the outer `else` branch (not a heading), but also matches the inner `while` exit condition `lines[i].trim().startsWith('#')` — so `paraLines` is empty and `i` is never incremented. The outer loop iterates the same line forever, hanging the browser.
+
+**Fix:** After the inner while, always increment `i` if nothing was consumed:
+```js
+} else {
+  i++; // Guard: skip unrecognised line to prevent infinite loop
+}
+```
+
+Also add `!lines[i].trim().startsWith('|')` to the paragraph inner-while conditions so table rows aren't swallowed into paragraphs.
+
+#### Table support
+
+Detect a table block: two or more consecutive lines starting with `|`. Parse with:
+```js
+function parseTableRow(row) {
+  return row.split('|').slice(1, -1).map(c => c.trim());
+}
+function isTableSeparator(row) {
+  return parseTableRow(row).every(c => /^[\s:-]+$/.test(c));
+}
+```
+Filter separator rows before building header + body. Render as `<table>` / `<thead>` / `<tbody>` with border-collapse and platform CSS vars for colours.
+
+**Key takeaway:** Any time a line-by-line parser has a catch-all `else` branch, it must guarantee forward progress (`i++`). Missing this in even one branch causes an infinite loop.
+
+---
+
+### Context Threading — Tool Date Range Fix
+
+**Problem:** User-selected date range (e.g. "Last 7 days") had no effect on the report. The agent always used the hardcoded default (30 days).
+
+**Root cause:** All four tool `execute` functions were written as `execute(input, _context)` — the underscore prefix was intentional, suppressing the linter warning. When Claude calls a tool without a `days` argument (which it does by default, relying on defaults), `input.days` is `undefined`. The `context.days` value (set from the UI) was silently ignored.
+
+**Fix:**
+```js
+async execute(input, context) {
+  return service.getData(context.days ?? input.days ?? 30);
+}
+```
+
+**Why Claude omits arguments:** Claude's tool-use reasoning may determine that a tool's description implies a default and not include optional parameters. Never assume `input` will carry user-selected values — always thread them through `context` and read from `context` first.
+
+**The full context flow:**
+```
+UI POST body → createAgentRoute context → runFn(context) → agentOrchestrator.run({ context }) → tool.execute(input, context)
+```
+Every layer must pass `context` through. Any agent that accepts user input (date range, filters, etc.) must read from `context`, not `input`.
+
+---
+
+### Two-Store Config Pattern — Admin vs Agent Settings
+
+**Principle:** Config that controls cost and security (model, max tokens, max iterations, kill switch) belongs to the administrator. Config that controls analytical behaviour (lookback, thresholds, schedule) belongs to the operator. These must be stored separately with separate access controls.
+
+| Setting type | Storage | Table/Key | Who can change |
+|---|---|---|---|
+| Admin (model, cost, kill switch) | `system_settings` | key = `agent_<slug>` | org_admin only |
+| Agent (schedule, thresholds, lookback) | `agent_configs` | row per (org_id, slug) | org_admin (future: per-org operator) |
+
+**Why separate tables?** An operator should never accidentally (or intentionally) change the cost guardrails while editing their analytical thresholds. The API routes enforce this: `/:slug/admin` requires org_admin; `/:slug` is readable by any authenticated user.
+
+**`AgentConfigService` is the canonical access pattern** — never read from either table directly in agent or route code. The service owns defaults, merging, and error fallback. New agents add their defaults to `AGENT_DEFAULTS` and `ADMIN_DEFAULTS` in that file.
+
+---
+
+### `buildSystemPrompt(config)` — Dynamic Prompt Injection
+
+Static system prompts make thresholds invisible to operators. When a threshold is hardcoded in a string, changing it requires a code change and redeploy.
+
+**Pattern:** Export a function that builds the prompt from live config:
+```js
+// prompt.js
+export function buildSystemPrompt({ ctr_threshold_pct, wasted_clicks_threshold, impressions_min, max_suggestions }) {
+  return `...Flag campaigns where CTR < ${ctr_threshold_pct}%...produce at most ${max_suggestions} recommendations...`;
+}
+```
+
+Called at run time with the freshly-loaded agent config. Operator changes in the UI take effect on the next run, no restart needed.
+
+**Reusable:** every future agent with configurable analytical thresholds should use this pattern. Static prompts are fine for agents with no operator-configurable parameters.
+
+---
+
+### `AgentScheduler` Hot-Reload
+
+When `node-cron` schedules a job and you want to change it, you must stop the old task and create a new one — you cannot mutate a running task.
+
+**Pattern:**
+```js
+_jobs = {};
+
+register({ slug, schedule, runFn, orgId }) {
+  if (this._jobs[slug]) this._jobs[slug].stop();
+  this._jobs[slug] = cron.schedule(schedule, handler);
+}
+
+updateSchedule(slug, newSchedule) {
+  if (this._jobs[slug]) this._jobs[slug].stop();
+  this.register({ slug, schedule: newSchedule, ... });
+}
+```
+
+`updateSchedule` is called from the `PUT /api/agent-configs/:slug` route when the `schedule` field changes. This means an operator can change the cron expression from the UI and it takes effect immediately without a server restart.
+
+**Lesson from the bad edit:** When editing a file that has deeply nested callbacks (`cron.schedule(expr, async () => { ... })`), partial edits can introduce mismatched braces that break the entire module. When a file has complex nesting, prefer a full rewrite over a multi-hunk patch.
+
+---
+
+### Admin/Operator Settings Boundary — UI Design
+
+**Keep admin and operator settings in separate pages.** The Admin Agents page (`/admin/agents`) only shows kill switch, model, and cost guardrails. The Agent Settings panel (inside the tool page itself) shows analytical and scheduling settings. Mixing them into a single panel creates confusion about who has authority over what.
+
+`AdminAgentsPage.jsx` pattern:
+- Always show a meaningful error state, not a permanent loading spinner. If the API call fails, say why and what to do (e.g. "Restart the server if this is the first run.")
+- `isDirty` computed as `JSON.stringify(cfg) !== JSON.stringify(saved)` — disables Save button when nothing has changed
+- Discard button resets `cfg` to `saved` without a network call
+
+---
+
+### IconProvider — All Icons Must Be Registered
+
+`client/src/providers/IconProvider.jsx` exports `semanticMap` — a map from semantic name (`'bot'`, `'shield'`, etc.) to Lucide component name. Icons used anywhere in the app **must** appear in this map. Unregistered names silently render nothing — no error, no fallback, no warning.
+
+When adding a new sidebar link or UI element with an icon:
+1. Decide the semantic name (e.g. `'bot'`)
+2. Find the matching Lucide component name (e.g. `'Bot'`)
+3. Add it to `semanticMap` in `IconProvider.jsx`
+
+This was the cause of the missing Agents sidebar icon. The `bot` entry was absent; the sidebar link rendered with no icon and no indication of the problem.
+
+**When to check:** any time a new icon name is used in a component via `getIcon('name')` — verify it exists in `semanticMap` before shipping.

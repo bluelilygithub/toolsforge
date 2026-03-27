@@ -9,6 +9,7 @@ import TopNav from './TopNav';
 const ADMIN_LINKS = [
   { path: '/admin/users',           label: 'Users',            icon: 'users' },
   { path: '/admin/ai-models',       label: 'AI Models',        icon: 'cpu' },
+  { path: '/admin/agents',          label: 'Agents',           icon: 'bot' },
   { path: '/admin/email-templates', label: 'Email Templates',  icon: 'mail' },
   { path: '/admin/security',        label: 'Security',         icon: 'shield' },
   { path: '/admin/app-settings',    label: 'App Settings',     icon: 'globe' },
@@ -106,8 +107,9 @@ export default function AppShell() {
   const { sidebarCollapsed, toggleSidebar } = useToolStore();
   const [mobileOpen, setMobileOpen] = useState(false);
 
-  const tools = getPermittedTools(user?.role);
-  const isAdmin = user?.role === 'org_admin';
+  const primaryRole = user?.roles?.find(r => r.scope_type === 'global')?.name ?? null;
+  const tools = getPermittedTools(primaryRole);
+  const isAdmin = primaryRole === 'org_admin';
   const sidebarWidth = sidebarCollapsed ? 56 : 220;
 
   useEffect(() => {
@@ -125,8 +127,7 @@ export default function AppShell() {
       {/* Fixed desktop sidebar */}
       <aside
         className="hidden md:flex flex-col fixed left-0 top-14 bottom-0 z-40 overflow-hidden"
-        style={{ background: 'var(--color-surface)', borderRight: '1px solid var(--color-border)' }}
-        style={{ width: sidebarWidth, transition: 'width 200ms ease' }}
+        style={{ background: 'var(--color-surface)', borderRight: '1px solid var(--color-border)', width: sidebarWidth, transition: 'width 200ms ease' }}
       >
         <SidebarLinks
           tools={tools}
@@ -147,8 +148,9 @@ export default function AppShell() {
       {/* Mobile sidebar */}
       <aside
         className="fixed left-0 top-14 bottom-0 z-50 flex flex-col md:hidden overflow-hidden"
-        style={{ background: 'var(--color-surface)', borderRight: '1px solid var(--color-border)' }}
         style={{
+          background: 'var(--color-surface)',
+          borderRight: '1px solid var(--color-border)',
           width: 220,
           transform: mobileOpen ? 'translateX(0)' : 'translateX(-100%)',
           transition: 'transform 200ms ease',

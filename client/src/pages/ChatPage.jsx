@@ -5,6 +5,7 @@ import api from '../utils/apiClient';
 import ModelAdvisorModal from '../components/ModelAdvisorModal';
 import VoiceInputButton from '../components/VoiceInputButton';
 import ReadAloudButton from '../components/ReadAloudButton';
+import MarkdownRenderer from '../components/MarkdownRenderer';
 import { useSpeechInput } from '../hooks/useSpeechInput';
 import { useReadAloud } from '../hooks/useReadAloud';
 import { useClipboardMedia } from '../hooks/useClipboardMedia';
@@ -73,14 +74,14 @@ function Message({ role, content, images, receivedAt, timezone }) {
         {/* Message bubble */}
         {content && (
           <div
-            className="rounded-2xl px-4 py-2.5 text-sm whitespace-pre-wrap"
+            className={`rounded-2xl px-4 py-2.5 text-sm${isUser ? ' whitespace-pre-wrap' : ''}`}
             style={{
               background: isUser ? 'var(--color-primary)' : 'var(--color-surface)',
               color: isUser ? '#fff' : 'var(--color-text)',
               border: isUser ? 'none' : '1px solid var(--color-border)',
             }}
           >
-            {content}
+            {isUser ? content : <MarkdownRenderer content={content} />}
           </div>
         )}
 

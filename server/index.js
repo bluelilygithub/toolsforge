@@ -17,7 +17,9 @@ const userSettingsRoutes = require('./routes/userSettings');
 const filesRoutes        = require('./routes/files');
 const adminUsageRoutes   = require('./routes/adminUsage');
 const projectsRoutes     = require('./routes/projects');
-const searchRoutes       = require('./routes/search');
+const searchRoutes           = require('./routes/search');
+const googleAdsMonitorRoutes = require('./routes/agents/googleAdsMonitor');
+const agentConfigRoutes      = require('./routes/agentConfigs');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -72,6 +74,8 @@ app.use('/api/files',             filesRoutes);
 app.use('/api/admin',             adminUsageRoutes);
 app.use('/api/projects',          projectsRoutes);
 app.use('/api/search',            searchRoutes);
+app.use('/api/agents/google-ads-monitor', googleAdsMonitorRoutes);
+app.use('/api/agent-configs',            agentConfigRoutes);
 
 // Static files + React Router catch-all — after all API routes so /api/* is never intercepted
 const clientDist = path.join(__dirname, 'public');

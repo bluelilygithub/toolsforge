@@ -947,4 +947,281 @@ A lightweight bookkeeping and invoicing module built into Curam Vault. Purpose-b
 - Invoice paid → DR Bank, CR Accounts Receivable
 - Expense recorded → DR Expenses (ex-GST), DR GST Paid, CR Bank (total paid)
 - Wage payment → DR Wages, CR Bank (net), CR Accounts Payable (tax withheld)
+
+---
+
+## ToolsForge
+
+A multi-user modular platform for teams — role-based access, org-scoped AI agents, shared data services, and a reusable agent platform layer.
+
+**Stack:** Node.js/Express · React/Vite · PostgreSQL 15 + pgvector · Anthropic Claude · Railway
+**Auth:** JWT session tokens, role-based permissions (org_admin / org_member), per-tool permission scopes
+**Status:** Active development
+
+---
+
+### Platform Architecture
+
+```
+client/src/                     React/Vite SPA
+  stores/                       Zustand (authStore, toolStore)
+  tools/                        Per-agent UI modules
+  utils/apiClient.js            Fetch wrapper with 401 interception
+
+server/
+  middleware/requireAuth.js     JWT auth + requireRole factory
+  services/permissions.js       PermissionService — hasRole, isOrgAdmin, canUseModel
+  services/AgentOrchestrator.js Tool-agnostic ReAct loop (Claude ↔ tools)
+  services/ToolRegistry.js      Per-tool-slug tool registration + permission filtering
+  services/StateManager.js      Agent key-value memory + conclusion persistence
+  services/AgentScheduler.js    Full-featured cron scheduler → agent_executions
+  platform/createAgentRoute.js  Factory: POST /run (SSE) + GET /history → agent_runs
+  platform/AgentScheduler.js    Lightweight cron wrapper → agent_runs (shared with route)
+  routes/stream.js              Generic SSE streaming for chat tools
+  routes/agents/                One file per agent, wired via createAgentRoute
+  db.js                         initializeSchema() — all DDL here, idempotent on startup
+```
+
+---
+
+### Agent Platform Primitives
+
+All primitives are reusable by any future agent. Adding a new agent requires only `tools.js`, `prompt.js`, and one route file.
+
+#### `createAgentRoute({ slug, runFn, requiredPermission })`
+
+Location: `server/platform/createAgentRoute.js`
+
+Returns an Express router with two endpoints:
+
+| Endpoint | Auth | Description |
+|---|---|---|
+| `POST /run` | requireAuth + requireRole([org_admin, permission]) | SSE stream — calls runFn, persists to agent_runs, emits progress → result → [DONE] |
+| `GET /history` | requireAuth | Last 20 runs for this slug + org, ordered by run_at DESC |
+
+Internal helpers (zero agent-specific code):
+- `extractToolData(trace)` — walks AgentOrchestrator trace steps, keys tool results by name into a JSONB-ready object
+- `extractSuggestions(text)` — parses `### Recommendations` numbered list from agent result text; assigns priority (high/medium/low) by position
+- `persistRun(...)` — exported; shared with platform/AgentScheduler
+
+SSE events emitted: `{ type: 'progress', text }` · `{ type: 'result', data }` · `{ type: 'error', error }` · `[DONE]`
+
+#### `AgentScheduler.register({ slug, schedule, runFn, orgId })`
+
+Location: `server/platform/AgentScheduler.js`
+
+Thin cron wrapper using `node-cron`. On each tick: resolves orgId from DB if omitted (single active org fallback), calls runFn, persists to agent_runs via shared persistRun. Logs success/failure. Zero agent-specific code.
+
+#### `persistRun({ slug, orgId, status, summary, trace, tokensUsed, startTime })`
+
+Exported from `createAgentRoute.js`. Single write path to `agent_runs` for both HTTP-triggered and cron-triggered runs.
+
+#### `MarkdownRenderer` — `client/src/components/MarkdownRenderer.jsx`
+
+Zero-dependency markdown renderer for all LLM text output. Handles `#`/`##`/`###` headings, `**bold**`, bullet lists, ordered lists, `---` rules, and paragraphs. Styling uses platform CSS vars throughout.
+
+**Convention:** all agent UIs that display LLM text use `MarkdownRenderer`. Never use `<pre>` or `whitespace-pre-wrap` for agent output directly. Improvements to rendering are made once here and propagate to every agent.
+
+#### `LineChart` — `client/src/components/charts/LineChart.jsx`
+
+Zero-dependency SVG dual-axis line chart. Generic props: `data`, `xKey`, `leftKey`, `rightKey`, `leftLabel`, `rightLabel`, `leftFormat`, `rightFormat`, `leftColor`, `rightColor`. Use when Recharts is unavailable or a zero-dependency fallback is preferred.
+
+---
+
+### Database Schema
+
+#### Agent Platform Tables
+
+| Table | Key columns |
+|---|---|
+| `agent_runs` | id (UUID), org_id, slug, status (running/complete/error), summary (TEXT — agent result), data (JSONB — tool results keyed by name), suggestions (JSONB — [{text, priority}]), run_at, duration_ms, token_count |
+| `agent_states` | org_id, tool_slug, session_id, key, value (JSONB) — key-value memory scoped per org + agent |
+| `agent_conclusions` | org_id, tool_slug, run_id (UUID UNIQUE), result (TEXT), trace (JSONB), tokens_used (JSONB) — raw conclusion store |
+| `agent_schedules` | agent_id (UNIQUE), tool_slug, org_id, schedule (cron), enabled, last_run_at, last_run_status |
+| `agent_executions` | agent_id, org_id, trigger_type, status, result (JSONB), tokens_used — full execution history |
+
+Index on `agent_runs`: `(org_id, slug, run_at DESC)`
+
+---
+
+### Agent Tools
+
+#### Google Ads Monitor
+
+| Detail | Value |
+|---|---|
+| Route | `POST /api/agents/google-ads-monitor/run` (SSE), `GET /api/agents/google-ads-monitor/history` |
+| Schedule | `0 6,18 * * *` — 6am and 6pm UTC (4pm and 4am AEST) |
+| Permission | `google_ads_monitor.run` (org_admin always allowed) |
+| Data sources | Google Ads API v23 · GA4 Data API v1beta |
+| Agent file | `server/agents/googleAdsMonitor/index.js` — `runAdsMonitor(context)` |
+
+**Tools registered (ToolRegistry, slug `google-ads-monitor`):**
+
+| Tool | Service method | Returns |
+|---|---|---|
+| `get_campaign_performance` | GoogleAdsService | Per-campaign: id, name, status, budget, impressions, clicks, cost (AUD), conversions, ctr, avgCpc |
+| `get_daily_performance` | GoogleAdsService | Daily: date, impressions, clicks, cost (AUD), conversions |
+| `get_search_terms` | GoogleAdsService | Top 50 terms by clicks: term, status, impressions, clicks, cost, conversions, ctr |
+| `get_analytics_overview` | GoogleAnalyticsService | Daily GA4: date, sessions, activeUsers, newUsers, bounceRate |
+
+**React UI** (`client/src/tools/GoogleAdsMonitor/`):
+
+| Component | Data source | Description |
+|---|---|---|
+| `GoogleAdsMonitorPage.jsx` | GET /history + POST /run SSE | Top-level page; fetches latest run on mount, streams new runs, refreshes history on completion; indeterminate sweep progress bar + elapsed timer while running; Full Analysis rendered via `MarkdownRenderer` |
+| `CampaignPerformanceTable.jsx` | `run.data.get_campaign_performance` | name · status badge · impressions · clicks · CTR · cost (AUD) · conversions · CPA |
+| `SearchTermsTable.jsx` | `run.data.get_search_terms` | term · clicks · impressions · CTR · cost · intent bucket (Converting / Wasted Spend / Ad Copy Oppty / Standard) |
+| `PerformanceChart.jsx` | `run.data.get_daily_performance` | Recharts dual-axis LineChart — Spend (AUD, left) + Conversions (right); custom AUD tooltip |
+| `AISuggestionsPanel.jsx` | `run.suggestions` | Priority-badged cards — high (positions 1–2) / medium (3–5) / low (6+) |
+
+**Intent bucket logic (derived from metrics, no AI call):**
+- Converting → `conversions > 0`
+- Wasted Spend → `clicks >= 5 && conversions === 0`
+- Ad Copy Oppty → `impressions >= 100 && ctr < 0.05`
+- Standard → everything else
 - BAS paid → DR GST Collected (1A), CR GST Paid (1B), CR Bank (net GST owed)
+
+**Updated UI** (`client/src/tools/GoogleAdsMonitor/GoogleAdsMonitorPage.jsx`):
+
+The page was substantially extended. Current capabilities:
+
+| Feature | Detail |
+|---|---|
+| Date range selector | Preset pills: Day / Week / Month / Qtr / Year / Custom. Active preset shown with primary-colour border. Custom reveals a numeric input (days). Sends `{ days: activeDays }` in the POST body. |
+| Run history panel | Sidebar table showing all past runs — date, status badge, summary preview. Click any row to view that run in the main panel. Newest run is auto-selected after each new run completes. |
+| Agent Settings panel | Collapsible panel. Loads from `GET /api/agent-configs/google-ads-monitor`. Editable fields: schedule (cron), lookback days, ctr_threshold_pct, wasted_clicks_threshold, impressions_min, max_suggestions. Save triggers `PUT /api/agent-configs/google-ads-monitor`. Saving a new lookback also syncs the date range preset. |
+| ~70s run note | Small label next to Run Now button — "Typically takes ~70s" — sets user expectation before the run starts. |
+| MarkdownRenderer tables | Full Analysis block now renders markdown tables as styled HTML tables (see MarkdownRenderer below). |
+
+`fetchHistory(resetToLatest)` is the canonical history-load function. Pass `true` after a run completes to force-select the newest result; omit on mount to preserve user's current selection.
+
+---
+
+### Agent Configuration System
+
+Two-store pattern: admin settings (security, cost, kill switch) stored in `system_settings`; operator/agent settings (analytical, scheduling) stored in `agent_configs`.
+
+#### `AgentConfigService` — `server/services/AgentConfigService.js`
+
+| Method | Storage | Description |
+|---|---|---|
+| `getAgentConfig(orgId, slug)` | `agent_configs` table | Returns defaults merged with stored JSONB. Gracefully falls back to defaults on DB error. |
+| `updateAgentConfig(orgId, slug, patch, updatedBy)` | `agent_configs` table | Upserts config patch. Returns merged result. |
+| `getAdminConfig(slug)` | `system_settings` table | Key: `agent_<slug_underscored>`. Returns defaults merged with stored JSON. |
+| `updateAdminConfig(slug, patch, updatedBy)` | `system_settings` table | Saves merged config to system_settings. Returns merged result. |
+
+Default values per slug are defined in `AGENT_DEFAULTS` and `ADMIN_DEFAULTS` constants at the top of the service. All methods return the full merged object — callers never see a partial config.
+
+**Agent defaults (google-ads-monitor):**
+
+| Key | Default | Description |
+|---|---|---|
+| `schedule` | `'0 6,18 * * *'` | Cron expression |
+| `lookback_days` | `30` | Days of data to analyse |
+| `ctr_threshold_pct` | `2.0` | CTR % below which campaigns are flagged |
+| `wasted_clicks_threshold` | `5` | Clicks with zero conversions = wasted spend |
+| `impressions_min` | `100` | Minimum impressions to flag Ad Copy Oppty |
+| `max_suggestions` | `5` | Maximum recommendations to produce |
+
+**Admin defaults (google-ads-monitor):**
+
+| Key | Default | Description |
+|---|---|---|
+| `enabled` | `true` | Kill switch — false rejects all run requests |
+| `model` | `'claude-sonnet-4-6'` | Claude model for analysis |
+| `max_tokens` | `4096` | Output token cap |
+| `max_iterations` | `10` | Maximum ReAct loop iterations |
+
+#### `/api/agent-configs` Routes — `server/routes/agentConfigs.js`
+
+| Endpoint | Auth | Description |
+|---|---|---|
+| `GET /:slug` | requireAuth | Returns agent config for the caller's org |
+| `PUT /:slug` | org_admin | Updates agent config; calls `AgentScheduler.updateSchedule()` if schedule changed |
+| `GET /:slug/admin` | org_admin | Returns admin config (model, cost guardrails, kill switch) |
+| `PUT /:slug/admin` | org_admin | Saves admin config to system_settings |
+
+#### `createAgentRoute` — Admin Config Enforcement
+
+`createAgentRoute.js` now loads admin config before every run:
+
+1. Loads `AdminConfig` via `AgentConfigService.getAdminConfig(slug)`
+2. Checks `adminConfig.enabled` — if false, emits SSE error + `[DONE]` immediately (no agent code runs)
+3. Passes `model`, `maxTokens`, `maxIterations` from admin config into the `context` object
+4. Agent code reads `context.model` / `context.maxTokens` to forward to `AgentOrchestrator`
+
+This means admin guardrails are enforced platform-wide. No agent can bypass them.
+
+#### `AgentScheduler` Hot-Reload
+
+`AgentScheduler` (`server/platform/AgentScheduler.js`) now tracks active jobs in a `_jobs` map.
+
+| Method | Description |
+|---|---|
+| `register({ slug, schedule, runFn, orgId })` | Stops any existing job for this slug before registering the new one |
+| `updateSchedule(slug, newSchedule)` | Stops existing cron task and re-registers with new expression — no server restart required |
+| `getSchedule(slug)` | Returns the current cron expression for a slug |
+
+Called from the `PUT /api/agent-configs/:slug` route when the `schedule` field changes.
+
+#### Dynamic System Prompt — `buildSystemPrompt(config)`
+
+`server/agents/googleAdsMonitor/prompt.js` exports `buildSystemPrompt(config)` instead of a static string. Live threshold values from the agent config are injected into the prompt at run time:
+
+```js
+buildSystemPrompt({ ctr_threshold_pct, wasted_clicks_threshold, impressions_min, max_suggestions })
+```
+
+This means operator changes to thresholds in the Agent Settings panel take effect on the next run without any code changes or server restart.
+
+---
+
+### Admin UI — Agents Page
+
+`client/src/pages/AdminAgentsPage.jsx` — accessible at `/admin/agents` (org_admin only via sidebar).
+
+Contains `AdminSettingsSection` which loads from `GET /api/agent-configs/:slug/admin` and allows editing:
+- Kill switch (enabled toggle)
+- Model selector (Haiku 4.5 / Sonnet 4.6 / Opus 4.6)
+- Max output tokens
+- Max iterations
+
+Separate from the Agent Settings panel (analytical settings), which lives in the tool page itself.
+
+**Error state design:** If the API call fails (e.g. first run before DB is seeded), a red inline error message is shown: "Could not load settings — {error}. Restart the server if this is the first run." — not a permanent loading spinner.
+
+---
+
+### Updated Database Schema
+
+#### Agent Configuration Tables
+
+| Table | Key columns |
+|---|---|
+| `agent_configs` | id (UUID), org_id (INT FK → organizations), slug (TEXT), config (JSONB DEFAULT '{}'), updated_by (INT FK → users), updated_at — UNIQUE(org_id, slug) |
+
+Admin config is stored in the existing `system_settings` table under `key = 'agent_<slug_underscored>'`.
+
+---
+
+### Updated MarkdownRenderer
+
+`client/src/components/MarkdownRenderer.jsx` now supports markdown tables:
+
+- Consecutive `|`-prefixed lines are detected as a table block
+- Separator rows (`| --- | --- |`) are filtered out before rendering
+- Rendered as a styled `<table>` / `<thead>` / `<tbody>` consistent with platform CSS vars
+- **Infinite loop guard:** The paragraph branch now always increments `i` to prevent browser hangs when a line starts with `#` but has no space (e.g. `#hashtag`) — previously matched no branch and looped forever
+
+Table parsing helpers:
+```js
+function parseTableRow(row) {
+  return row.split('|').slice(1, -1).map(c => c.trim());
+}
+function isTableSeparator(row) {
+  return parseTableRow(row).every(c => /^[\s:-]+$/.test(c));
+}
+```
+
+Also applies to `ChatPage.jsx` — assistant messages now render via `MarkdownRenderer` instead of `whitespace-pre-wrap`.

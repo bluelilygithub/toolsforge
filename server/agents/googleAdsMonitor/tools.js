@@ -50,8 +50,10 @@ const getCampaignPerformanceTool = {
   requiredPermissions: [],
   toolSlug:            TOOL_SLUG,
 
-  async execute(input, _context) {
-    return googleAdsService.getCampaignPerformance(input.days ?? 30);
+  async execute(input, context) {
+    // context.days is the user-selected range from the UI (authoritative).
+    // input.days is Claude's optional tool argument — used only as a fallback.
+    return googleAdsService.getCampaignPerformance(context.days ?? input.days ?? 30);
   },
 };
 
@@ -66,8 +68,8 @@ const getDailyPerformanceTool = {
   requiredPermissions: [],
   toolSlug:            TOOL_SLUG,
 
-  async execute(input, _context) {
-    return googleAdsService.getDailyPerformance(input.days ?? 30);
+  async execute(input, context) {
+    return googleAdsService.getDailyPerformance(context.days ?? input.days ?? 30);
   },
 };
 
@@ -83,8 +85,8 @@ const getSearchTermsTool = {
   requiredPermissions: [],
   toolSlug:            TOOL_SLUG,
 
-  async execute(input, _context) {
-    return googleAdsService.getSearchTerms(input.days ?? 30);
+  async execute(input, context) {
+    return googleAdsService.getSearchTerms(context.days ?? input.days ?? 30);
   },
 };
 
@@ -99,8 +101,8 @@ const getAnalyticsOverviewTool = {
   requiredPermissions: [],
   toolSlug:            TOOL_SLUG,
 
-  async execute(input, _context) {
-    return googleAnalyticsService.getSessionsOverview(input.days ?? 30);
+  async execute(input, context) {
+    return googleAnalyticsService.getSessionsOverview(context.days ?? input.days ?? 30);
   },
 };
 

@@ -55,6 +55,7 @@ const semanticMap = {
   folder:          { lucide: 'Folder' },
   'bar-chart-2':   { lucide: 'BarChart2' },
   video:           { lucide: 'Video' },
+  bot:             { lucide: 'Bot' },
 };
 
 const IconContext = createContext(null);

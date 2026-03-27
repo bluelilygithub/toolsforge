@@ -597,6 +597,51 @@ async function initializeSchema() {
         ON agent_executions (org_id, started_at DESC)
     `);
 
+    // agent_runs — one row per completed agent run, shared across all agents.
+    // This is the single source of truth for run history, structured output,
+    // and AI suggestions. The data field stores tool results keyed by tool name;
+    // suggestions stores a priority-ordered array of recommendation objects.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS agent_runs (
+        id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        org_id      INTEGER     NOT NULL REFERENCES organizations(id),
+        slug        TEXT        NOT NULL,
+        status      TEXT        NOT NULL DEFAULT 'running'
+          CHECK (status IN ('running','complete','error')),
+        summary     TEXT,
+        data        JSONB,
+        suggestions JSONB,
+        run_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        duration_ms INTEGER,
+        token_count INTEGER
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_agent_runs_org_slug_run_at
+        ON agent_runs (org_id, slug, run_at DESC)
+    `);
+
+    // agent_configs — operator-level settings per org per agent slug.
+    // Readable by any authenticated user; writable by org_admin.
+    // Covers schedule, lookback window, analytical thresholds, output preferences.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS agent_configs (
+        id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        org_id     INTEGER     NOT NULL REFERENCES organizations(id),
+        slug       TEXT        NOT NULL,
+        config     JSONB       NOT NULL DEFAULT '{}',
+        updated_by INTEGER     REFERENCES users(id),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(org_id, slug)
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_agent_configs_org_slug
+        ON agent_configs (org_id, slug)
+    `);
+
     await client.query('COMMIT');
     logger.info('Core schema initialized');
 

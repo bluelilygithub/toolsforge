@@ -19,6 +19,8 @@ import ResetPasswordPage from './pages/ResetPasswordPage';
 import DateTimePage from './pages/DateTimePage';
 import ChatPage from './pages/ChatPage';
 import AdminAppSettingsPage from './pages/AdminAppSettingsPage';
+import GoogleAdsMonitorPage from './tools/GoogleAdsMonitor/GoogleAdsMonitorPage';
+import AdminAgentsPage from './pages/AdminAgentsPage';
 
 function App() {
   return (
@@ -41,6 +43,7 @@ function App() {
                   <Route path="/admin/ai-models" element={<AdminAIModelsPage />} />
                   <Route path="/admin/security" element={<AdminSecurityPage />} />
                   <Route path="/admin/app-settings" element={<AdminAppSettingsPage />} />
+                  <Route path="/admin/agents"       element={<AdminAgentsPage />} />
                   <Route path="/tools/datetime" element={<DateTimePage />} />
                   <Route path="/tools/chat" element={<ChatPage />} />
                   <Route path="/tools/advisor" element={
@@ -50,9 +53,7 @@ function App() {
                     <div className="p-8 text-slate-500">Projects — coming soon</div>
                   } />
                   <Route element={<RequireRole allowedRoles={['org_admin']} />}>
-                    <Route path="/tools/ads" element={
-                      <div className="p-8 text-slate-500">Google Ads — coming soon</div>
-                    } />
+                    <Route path="/tools/ads" element={<GoogleAdsMonitorPage />} />
                     <Route path="/tools/video" element={
                       <div className="p-8 text-slate-500">Video Studio — coming soon</div>
                     } />
