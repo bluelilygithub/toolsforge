@@ -21,6 +21,7 @@ import ChatPage from './pages/ChatPage';
 import AdminAppSettingsPage from './pages/AdminAppSettingsPage';
 import GoogleAdsMonitorPage from './tools/GoogleAdsMonitor/GoogleAdsMonitorPage';
 import AdminAgentsPage from './pages/AdminAgentsPage';
+import AdminDiagnosticsPage from './pages/AdminDiagnosticsPage';
 
 function App() {
   return (
@@ -44,6 +45,7 @@ function App() {
                   <Route path="/admin/security" element={<AdminSecurityPage />} />
                   <Route path="/admin/app-settings" element={<AdminAppSettingsPage />} />
                   <Route path="/admin/agents"       element={<AdminAgentsPage />} />
+                  <Route path="/admin/diagnostics"  element={<AdminDiagnosticsPage />} />
                   <Route path="/tools/datetime" element={<DateTimePage />} />
                   <Route path="/tools/chat" element={<ChatPage />} />
                   <Route path="/tools/advisor" element={

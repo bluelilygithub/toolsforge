@@ -14,6 +14,7 @@ const ADMIN_LINKS = [
   { path: '/admin/security',        label: 'Security',         icon: 'shield' },
   { path: '/admin/app-settings',    label: 'App Settings',     icon: 'globe' },
   { path: '/admin/logs',            label: 'Logs',             icon: 'scroll-text' },
+  { path: '/admin/diagnostics',    label: 'Diagnostics',      icon: 'activity' },
 ];
 
 function NavItem({ to, end, iconName, label, collapsed, onClick }) {

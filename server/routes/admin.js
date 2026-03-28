@@ -585,4 +585,120 @@ router.put('/app-settings', async (req, res) => {
   }
 });
 
+// POST /api/admin/diagnostics — run all credential and service checks
+router.post('/diagnostics', async (req, res) => {
+  const { google } = require('googleapis');
+  const Anthropic   = require('@anthropic-ai/sdk');
+  const { pool }    = require('../db');
+  const results     = [];
+
+  // ── Helper ──────────────────────────────────────────────────────────────────
+  async function check(name, fn) {
+    try {
+      const detail = await fn();
+      results.push({ name, ok: true, detail });
+    } catch (err) {
+      results.push({ name, ok: false, detail: err.message });
+    }
+  }
+
+  // ── 1. Database ──────────────────────────────────────────────────────────────
+  await check('Database', async () => {
+    const { rows } = await pool.query('SELECT NOW() AS ts');
+    return `Connected — server time ${rows[0].ts.toISOString()}`;
+  });
+
+  // ── 2. Anthropic API ─────────────────────────────────────────────────────────
+  await check('Anthropic API', async () => {
+    if (!process.env.ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY is not set');
+    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 16,
+      messages: [{ role: 'user', content: 'Reply with just: ok' }],
+    });
+    return 'API key valid — test message sent';
+  });
+
+  // ── 3. Google OAuth token refresh ────────────────────────────────────────────
+  let accessToken = null;
+  await check('Google OAuth', async () => {
+    if (!process.env.GOOGLE_CLIENT_ID)     throw new Error('GOOGLE_CLIENT_ID is not set');
+    if (!process.env.GOOGLE_CLIENT_SECRET) throw new Error('GOOGLE_CLIENT_SECRET is not set');
+    if (!process.env.GOOGLE_REFRESH_TOKEN) throw new Error('GOOGLE_REFRESH_TOKEN is not set');
+    const oauth2 = new google.auth.OAuth2(
+      process.env.GOOGLE_CLIENT_ID,
+      process.env.GOOGLE_CLIENT_SECRET
+    );
+    oauth2.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
+    const { token } = await oauth2.getAccessToken();
+    accessToken = token;
+    return `Token refreshed — ${token.slice(0, 10)}…`;
+  });
+
+  // ── 4. Google Ads API ────────────────────────────────────────────────────────
+  await check('Google Ads API', async () => {
+    if (!accessToken) throw new Error('Skipped — Google OAuth check failed');
+    const customerId = (process.env.GOOGLE_ADS_CUSTOMER_ID ?? '').replace(/-/g, '');
+    const managerId  = (process.env.GOOGLE_ADS_MANAGER_ID  ?? '').replace(/-/g, '');
+    const devToken   = process.env.GOOGLE_ADS_DEVELOPER_TOKEN ?? '';
+    if (!customerId) throw new Error('GOOGLE_ADS_CUSTOMER_ID is not set');
+    if (!managerId)  throw new Error('GOOGLE_ADS_MANAGER_ID is not set');
+    if (!devToken)   throw new Error('GOOGLE_ADS_DEVELOPER_TOKEN is not set');
+    const res = await fetch(
+      `https://googleads.googleapis.com/v23/customers/${customerId}/googleAds:search`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization':     `Bearer ${accessToken}`,
+          'developer-token':   devToken,
+          'login-customer-id': managerId,
+          'Content-Type':      'application/json',
+        },
+        body: JSON.stringify({ query: 'SELECT customer.id FROM customer LIMIT 1' }),
+      }
+    );
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      const inner = body?.error?.details?.[0]?.errors?.[0];
+      const msg = inner?.message ?? body?.error?.message ?? `HTTP ${res.status}`;
+      throw new Error(msg);
+    }
+    const data = await res.json();
+    const id = data.results?.[0]?.customer?.id ?? '(no result)';
+    return `Customer ${id} accessible`;
+  });
+
+  // ── 5. Google Analytics (GA4) ────────────────────────────────────────────────
+  await check('Google Analytics (GA4)', async () => {
+    if (!accessToken) throw new Error('Skipped — Google OAuth check failed');
+    const propertyId = process.env.GOOGLE_GA4_PROPERTY_ID ?? '';
+    if (!propertyId) throw new Error('GOOGLE_GA4_PROPERTY_ID is not set');
+    const res = await fetch(
+      `https://analyticsdata.googleapis.com/v1beta/properties/${propertyId}:runReport`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Content-Type':  'application/json',
+        },
+        body: JSON.stringify({
+          dateRanges: [{ startDate: '7daysAgo', endDate: 'today' }],
+          metrics:    [{ name: 'sessions' }],
+          limit:      1,
+        }),
+      }
+    );
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body?.error?.message ?? `HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    return `Property ${propertyId} accessible — ${data.rowCount ?? 0} rows`;
+  });
+
+  logger.info('Diagnostics run', { testedBy: req.user.email, passed: results.filter(r => r.ok).length, total: results.length });
+  res.json({ results });
+});
+
 module.exports = router;
