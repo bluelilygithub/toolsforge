@@ -642,6 +642,12 @@ async function initializeSchema() {
         ON agent_configs (org_id, slug)
     `);
 
+    // v0.3.1 — Account Intelligence Profile stored per agent config row.
+    await client.query(`
+      ALTER TABLE agent_configs
+        ADD COLUMN IF NOT EXISTS intelligence_profile JSONB NOT NULL DEFAULT '{}'
+    `);
+
     await client.query('COMMIT');
     logger.info('Core schema initialized');
 

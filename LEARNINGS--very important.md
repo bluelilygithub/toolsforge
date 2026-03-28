@@ -1137,6 +1137,28 @@ updateSchedule(slug, newSchedule) {
 
 ---
 
+### Railway Deploy — Missing Dependency (googleapis)
+
+**Symptom:** Healthcheck at `/api/health` fails on every Railway deploy attempt. All retries time out. The app runs fine locally.
+
+**Root cause:** `googleapis` was installed at the project root (`toolsforge/node_modules`) rather than inside `server/node_modules`. Node's module resolution walks up the directory tree, so locally `require('googleapis')` in `GoogleAdsService.js` and `GoogleAnalyticsService.js` resolves correctly. On Railway, the Dockerfile does:
+
+```dockerfile
+COPY server/package*.json ./
+RUN npm install --omit=dev
+COPY server/ ./
+```
+
+Only `server/` is copied into the container. The root `node_modules` never exists. `require('googleapis')` throws `MODULE_NOT_FOUND` at startup — before `app.listen()` is ever reached — so the health endpoint never responds.
+
+**Fix:** Add `googleapis` to `server/package.json` dependencies and regenerate `server/package-lock.json` with `npm install --package-lock-only` from inside `server/`.
+
+**General rule for this project:** Every `require(pkg)` in `server/` must be backed by an entry in `server/package.json`. The root `package.json` is irrelevant to the Railway build. When a new npm package is used in server code, always `cd server && npm install <pkg>` — never `npm install <pkg>` from the project root.
+
+**How to catch this before deploying:** Run `cd server && npm install --omit=dev && node --check index.js` (or actually start the server) from a clean environment where only `server/node_modules` exists. Any missing dependency will throw immediately. Alternatively, run `docker build .` locally before pushing — the build stage will fail on `require` errors the same way Railway does.
+
+---
+
 ### IconProvider — All Icons Must Be Registered
 
 `client/src/providers/IconProvider.jsx` exports `semanticMap` — a map from semantic name (`'bot'`, `'shield'`, etc.) to Lucide component name. Icons used anywhere in the app **must** appear in this map. Unregistered names silently render nothing — no error, no fallback, no warning.

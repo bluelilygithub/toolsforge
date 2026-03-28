@@ -6,20 +6,45 @@
  * Exported as buildSystemPrompt(config) so analytical thresholds and output
  * preferences from AgentConfigService are reflected without redeploying.
  *
+ * Structure (v0.3.1):
+ *   1. Account Intelligence Profile block (from buildAccountContext — injected
+ *      at runtime from config.intelligence_profile; empty string if not set)
+ *   2. Role and analytical framework
+ *   3. Data sources and how to use them
+ *   4. Analytical instructions
+ *   5. Output format
+ *   6. Baseline verification instruction
+ *
  * @param {object} config - agent config from AgentConfigService.getAgentConfig()
  * @returns {string}
  */
+
+const { buildAccountContext } = require('../../platform/buildAccountContext');
+
 function buildSystemPrompt(config = {}) {
   const ctrPct  = ((config.ctr_low_threshold  ?? 0.03) * 100).toFixed(0);
   const wasted  = config.wasted_clicks_threshold   ?? 5;
   const impMin  = config.impressions_ctr_threshold ?? 100;
   const maxSugg = config.max_suggestions           ?? 8;
 
-  return `You are a Google Ads performance analyst for a digital marketing team. \
+  // Block 1 — Account Intelligence Profile (may be empty string)
+  const accountContext = buildAccountContext(
+    config.intelligence_profile ?? null,
+    'google-ads-monitor'
+  );
+
+  // Prepend the account context block only when a profile is set.
+  // When empty, no blank lines are inserted — the prompt starts with the role.
+  const accountContextBlock = accountContext
+    ? `${accountContext}\n---\n\n`
+    : '';
+
+  return `${accountContextBlock}\
+You are a Google Ads performance analyst for a digital marketing team. \
 Your role is to analyse campaign data, identify inefficiencies, and produce specific, \
 actionable recommendations that can be acted on immediately.
 
-## Analysis approach
+## Data sources and how to use them
 
 Before writing any analysis, use your tools to gather the complete picture:
 1. Call get_campaign_performance to understand which campaigns are running and their totals.
@@ -74,7 +99,9 @@ Numbered list. Each recommendation must:
 - Be actionable without additional data (e.g. "Add [term] as exact-match negative keyword to [campaign]", \
 "Increase daily budget for [campaign] from $X to $Y to capture demand it is currently missing").
 
-Prioritise by estimated impact — highest first. Limit to ${maxSugg} recommendations maximum.`;
+Prioritise by estimated impact — highest first. Limit to ${maxSugg} recommendations maximum.
+
+Before finalising any recommendation, verify it against the declared account baselines in the Account Intelligence Profile above. If a recommendation contradicts a positive account-level metric, either withdraw it or reframe it as a refinement opportunity rather than a problem.`;
 }
 
 module.exports = { buildSystemPrompt };
